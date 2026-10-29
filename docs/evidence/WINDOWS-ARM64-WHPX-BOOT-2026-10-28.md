@@ -797,3 +797,14 @@ and matching restore through `WHvSetVirtualProcessorState`. Both API exports are
 present in the native system DLL on this machine. The inference to investigate
 next is a QEMU implementation using those APIs; export presence alone does not
 prove successful state transfer, ABI correctness, compatibility or restore.
+
+A subsequent native CLANGARM64 probe, `smoke-arm64-gic-state.c`, created a
+disposable one-vCPU partition without running guest code or attaching a disk.
+Both GIC state categories successfully completed same-partition get/set:
+per-vCPU state was 200 bytes and global state was 4096 bytes. Global state
+requires `WHV_ANY_VP`; using index zero initially failed. The corrected probe
+returned `GIC_SAME_PARTITION_GET_SET_OK` and exit 0, then deleted its partition.
+This establishes usable API calls on this host. It does not validate a new
+partition/process restore, pending interrupts, CPU/device continuity or an
+implemented QEMU migration path. Keep the existing migration blocker until
+those additional cases pass.
