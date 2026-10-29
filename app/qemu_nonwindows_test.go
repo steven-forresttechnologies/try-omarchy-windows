@@ -39,6 +39,7 @@ type config struct {
 	diskFormat                  string
 	qemu                        string
 	useGpu                      bool
+	arm64GPU                    bool
 	supportsSharing             bool
 	audio                       string
 	memMiB                      int

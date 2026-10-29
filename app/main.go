@@ -84,6 +84,9 @@ type config struct {
 	recoveryChoice *gpuRecoveryDecision
 	// venus offers guest Vulkan on the host GPU in GPU mode (venus.go).
 	venus bool
+	// Set only by the separately built, locally pinned ARM development entry.
+	guestArchitecture string
+	arm64GPU          bool // Verified private ICD; selected only by arm64dev.
 }
 
 // memoryStarved reports whether the current attempt's QEMU died because the
@@ -137,6 +140,9 @@ func finishSetupCancellation(cfg *config, err error) bool {
 }
 
 func main() {
+	if runARM64Development(os.Args[1:]) {
+		return
+	}
 	// Windows runs this for an allowed link. The link is untrusted text, so
 	// it is never mixed with the ordinary flags; see parseURLActivation.
 	if dir, url, activation, ok := parseURLActivation(os.Args[1:]); activation {
@@ -1097,7 +1103,15 @@ func supervise(cfg *config, cmdline string) bool {
 			cfg.audioRates = launchAudioSampleRates(cfg.audioDevices, audioSelection, cfg.desktop.MicrophoneDisabled)
 			logf("SDL audio sample rates: output=%d Hz input=%d Hz", cfg.audioRates.Output, cfg.audioRates.Input)
 		}
-		proc = exec.Command(cfg.qemu, buildQemuArgs(cfg, cmdline)...)
+		args := buildQemuArgs(cfg, cmdline)
+		if cfg.guestArchitecture == "aarch64" {
+			args, err = buildQemuArgsForArch(cfg, cmdline, "aarch64")
+			if err != nil {
+				fatal(err.Error())
+			}
+			logf("ARM64 development QEMU arguments: %q", args)
+		}
+		proc = exec.Command(cfg.qemu, args...)
 		if !audioSelection && (cfg.audioDevices.Output != "" || (!cfg.desktop.MicrophoneDisabled && cfg.audioDevices.Input != "")) {
 			logf("Selected audio devices require the updated SDL runtime; this attempt uses Windows defaults")
 		}
@@ -1116,6 +1130,9 @@ func supervise(cfg *config, cmdline string) bool {
 		externalHook := keyboardRuntimeSupportsExternalHook(cfg.qemu)
 		qemuExternalKeyboardHook.Store(externalHook)
 		proc.Env = keyboardEnvironment(proc.Env, externalHook)
+		if cfg.guestArchitecture == "aarch64" {
+			configureARM64DevelopmentQEMU(proc, cfg.useGpu)
+		}
 		if cfg.useGpu {
 			cfg.displayDriver = displayDriverIdentity()
 			logGPULaunchFacts(cfg, proc.Env, dxgiAdapterFacts(), qemuGPUPreference(cfg.qemu))

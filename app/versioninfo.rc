@@ -8,6 +8,7 @@
 //
 //   llvm-rc /FO rsrc.res versioninfo.rc
 //   llvm-cvtres /MACHINE:X64 /OUT:rsrc_windows_amd64.syso rsrc.res
+//   llvm-cvtres /MACHINE:ARM64 /OUT:rsrc_windows_arm64.syso rsrc.res
 //   rm rsrc.res
 //
 // Keep FILEVERSION and the version strings in step with currentVersion in

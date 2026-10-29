@@ -8,6 +8,30 @@ import (
 	"testing"
 )
 
+func TestHostArchUnsupportedReasonFor(t *testing.T) {
+	tests := []struct {
+		name        string
+		processArch string
+		native      uint16
+		want        string
+	}{
+		{"native amd64", "amd64", imageFileMachineAmd64, ""},
+		// Older Windows versions cannot report the native architecture; preserve
+		// the existing amd64 fallback for those systems.
+		{"unknown native architecture", "amd64", 0, ""},
+		{"emulated amd64 on arm64", "amd64", imageFileMachineArm64, intelAMDOnlyMessage(uiText("arch.arm64_emulated"))},
+		{"native arm64", "arm64", imageFileMachineArm64, intelAMDOnlyMessage(uiText("arch.arm64"))},
+		{"arm64 with unknown native architecture", "arm64", 0, intelAMDOnlyMessage(uiText("arch.arm64"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostArchUnsupportedReasonFor(tt.processArch, tt.native); got != tt.want {
+				t.Fatalf("hostArchUnsupportedReasonFor(%q, %#x) = %q, want %q", tt.processArch, tt.native, got, tt.want)
+			}
+		})
+	}
+}
+
 // The machine the test runs on decides which branch applies: CI and real
 // user hardware are x64-on-x64 (must run), ARM64 Windows gets the stop
 // message. Either way, when a message is produced it must name the hardware

@@ -105,6 +105,10 @@
       {
         "file": "patches/qemu/0024-raise-windows-fd-setsize-for-slirp.patch",
         "sha256": "ba94ed3e314c9388aeba6e888747d92e797f1c98c9c546b4ed71a76f10163059"
+      },
+      {
+        "file": "patches/qemu/0025-guard-x86-host-cpu-realize-on-whpx.patch",
+        "sha256": "499aa3bf66f1b7eee56cb01b6aef49a15ffeb606993dfefaca7c1e9cd78ffb24"
       }
     ]
   },
@@ -135,6 +139,18 @@
       {
         "file": "patches/virglrenderer/0005-batch-intel-windows-buffer-uploads.patch",
         "sha256": "af35a04151d4e9d14ed0c86ba3741a45e0af6e47c8ced747e7523dc1eab8a34d"
+      },
+      {
+        "file": "patches/virglrenderer/0006-fix-win32-tss-destructor-prototype.patch",
+        "sha256": "234e25bdbc7bd40aad1af995d2186cf019ea48e6d3e4bbc3473efa0fc67d039c"
+      },
+      {
+        "file": "patches/virglrenderer/0007-complete-windows-resource-error-replies.patch",
+        "sha256": "eb461f7de989af7c8f6dc520aefd3f7b7f48719abf3b633c99af45c5501561b3"
+      },
+      {
+        "file": "patches/virglrenderer/0008-preserve-host-pointer-resource-classes.patch",
+        "sha256": "1a6ef5fcfe277a739781ca4b7b166e6f2c24eb393cd605b2a84568171a25f469"
       }
     ]
   }

@@ -48,12 +48,19 @@ func nativeMachine() uint16 {
 // only then blamed firmware virtualization settings (VT-x/SVM) that ARM
 // firmware does not even have.
 func hostArchUnsupportedReason() string {
-	if runtime.GOARCH != "amd64" {
+	return hostArchUnsupportedReasonFor(runtime.GOARCH, nativeMachine())
+}
+
+// hostArchUnsupportedReasonFor keeps the decision independent of the machine
+// running the test. In particular, an amd64 process on ARM64 is not a native
+// amd64 host, and a native ARM64 launcher still needs matching payloads.
+func hostArchUnsupportedReasonFor(processArch string, native uint16) string {
+	if processArch != "amd64" {
 		// A future native ARM64 launcher would still ship the x86_64 guest
 		// and runtime today, so it gets the same message.
 		return intelAMDOnlyMessage(uiText("arch.arm64"))
 	}
-	if nativeMachine() == imageFileMachineArm64 {
+	if native == imageFileMachineArm64 {
 		return intelAMDOnlyMessage(uiText("arch.arm64_emulated"))
 	}
 	return ""

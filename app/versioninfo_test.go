@@ -27,7 +27,7 @@ func fixedFileInfo(t *testing.T, syso []byte) (file, product [4]uint16) {
 	binary.LittleEndian.PutUint32(sig, 0xFEEF04BD)
 	i := bytes.Index(syso, sig)
 	if i < 0 || i+24 > len(syso) {
-		t.Fatal("no VS_FIXEDFILEINFO block in rsrc_windows_amd64.syso")
+		t.Fatal("no VS_FIXEDFILEINFO block in resource object")
 	}
 	read := func(off int) [4]uint16 {
 		ms := binary.LittleEndian.Uint32(syso[i+off:])
@@ -54,23 +54,34 @@ func TestVersionInfoResourceMatchesCurrentVersion(t *testing.T) {
 		want[i] = uint16(n)
 	}
 
-	syso, err := os.ReadFile("rsrc_windows_amd64.syso")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Match the trailing NUL of the resource string: without it a shortened
-	// currentVersion would pass as a prefix of a stale one, e.g. "v0.0.7"
-	// matching inside a leftover "v0.0.7-preview".
-	if n := bytes.Count(syso, utf16le(currentVersion+"\x00")); n < 2 {
-		t.Errorf("rsrc_windows_amd64.syso carries %q %d time(s), want it in both FileVersion "+
-			"and ProductVersion - rebuild it from versioninfo.rc", currentVersion, n)
-	}
-	file, product := fixedFileInfo(t, syso)
-	if file != want {
-		t.Errorf("compiled FILEVERSION = %v, want %v", file, want)
-	}
-	if product != want {
-		t.Errorf("compiled PRODUCTVERSION = %v, want %v", product, want)
+	for _, resource := range []struct {
+		name    string
+		machine uint16
+	}{
+		{"rsrc_windows_amd64.syso", 0x8664},
+		{"rsrc_windows_arm64.syso", 0xaa64},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			syso, err := os.ReadFile(resource.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(syso) < 2 || binary.LittleEndian.Uint16(syso[:2]) != resource.machine {
+				t.Fatalf("%s has the wrong COFF machine type", resource.name)
+			}
+			// Include the trailing NUL so a prefix of a stale version cannot pass.
+			if n := bytes.Count(syso, utf16le(currentVersion+"\x00")); n < 2 {
+				t.Errorf("%s carries %q %d time(s), want it in both FileVersion "+
+					"and ProductVersion - rebuild it from versioninfo.rc", resource.name, currentVersion, n)
+			}
+			file, product := fixedFileInfo(t, syso)
+			if file != want {
+				t.Errorf("compiled FILEVERSION = %v, want %v", file, want)
+			}
+			if product != want {
+				t.Errorf("compiled PRODUCTVERSION = %v, want %v", product, want)
+			}
+		})
 	}
 
 	rc, err := os.ReadFile("versioninfo.rc")

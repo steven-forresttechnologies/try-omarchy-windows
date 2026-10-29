@@ -55,6 +55,10 @@ def main() -> None:
         "msys2Packages": package_lines,
         "files": files,
     }
+    for component in ("mesa", "dxc"):
+        extra_lock = args.runtime / f"provenance/{component}-arm64.lock.json"
+        if extra_lock.is_file():
+            manifest["sources"][component] = json.loads(extra_lock.read_text(encoding="utf-8"))
     args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 

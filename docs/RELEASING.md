@@ -69,7 +69,7 @@ artifact for verification. Use it after changing the OIDC or signing configurati
    `defaultReleaseURL`, `defaultSumsSHA256`, and the embedded fixture name in
    `app/manifest.go`. Update `currentVersion` in `app/update.go` and the numeric and text versions
    in `app/versioninfo.rc` to the same tag. Regenerate
-   `app/rsrc_windows_amd64.syso` using the commands in `versioninfo.rc`.
+   `app/rsrc_windows_amd64.syso` and `app/rsrc_windows_arm64.syso` using the commands in `versioninfo.rc`.
 5. Run `scripts/release/validate-pin.py TAG`, commit, and push the pin.
 
 The pinned tag must be on `master` before `publish` runs: the workflow's guard

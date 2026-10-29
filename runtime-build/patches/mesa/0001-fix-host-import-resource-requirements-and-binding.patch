@@ -1,0 +1,40 @@
+From: Try Omarchy contributors
+Subject: [PATCH] dzn: retain host-import memory types and binding resource flags
+
+Host allocations use host-visible heaps rather than Win32 shared heaps.
+Retain their memory types and pass the descriptor containing imported-memory
+resource flags to CreatePlacedResource.
+
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -3137,7 +3137,8 @@
+ 
+    const VkExternalMemoryBufferCreateInfo *external_info =
+       vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+-   if (external_info && external_info->handleTypes != 0)
++   if (external_info && (external_info->handleTypes &
++       ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT))
+       buf->shared = true;
+ 
+    *out = dzn_buffer_to_handle(buf);
+@@ -3332,7 +3333,7 @@
+          desc.Flags |= mem->res_flags;
+          if (FAILED(ID3D12Device1_CreatePlacedResource(device->dev, mem->heap,
+                                                        pBindInfos[i].memoryOffset,
+-                                                       &buffer->desc,
++                                                       &desc,
+                                                        D3D12_RESOURCE_STATE_COMMON,
+                                                        NULL,
+                                                        &IID_ID3D12Resource,
+--- a/src/microsoft/vulkan/dzn_image.c
++++ b/src/microsoft/vulkan/dzn_image.c
+@@ -909,7 +909,8 @@
+       .alignment = info.Alignment,
+       .memoryTypeBits =
+          dzn_physical_device_get_mem_type_mask_for_resource(pdev, &image->desc,
+-                                                            image->vk.external_handle_types != 0),
++            (image->vk.external_handle_types &
++             ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0),
+    };
+ 
+    /*

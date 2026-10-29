@@ -43,6 +43,8 @@ jobs:
           python3 -m py_compile scripts/gpu/blender/smoke.py
           bash -n scripts/gpu/blender/build-arch.sh
           python3 runtime-build/validate-lock.py
+          python3 runtime-build/build-mesa-arm64.py --validate
+          python3 runtime-build/prepare-dxc-arm64.py --validate
           bash -n runtime-build/*.sh
 
       - name: Test launcher
@@ -55,10 +57,15 @@ jobs:
           go vet ./...
           # Win32 callbacks and COM APIs pass pointers through uintptr by contract.
           GOOS=windows GOARCH=amd64 go vet -unsafeptr=false ./...
+          GOOS=windows GOARCH=arm64 go vet -unsafeptr=false ./...
+          GOOS=windows GOARCH=arm64 go vet -tags arm64dev -unsafeptr=false ./...
 
       - name: Build Windows launcher
         working-directory: app
-        run: GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o ../TryOmarchy.exe .
+        run: |
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o ../TryOmarchy.exe .
+          GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-H windowsgui -s -w" -o ../TryOmarchy-arm64.exe .
+          GOOS=windows GOARCH=arm64 go build -tags arm64dev -trimpath -o ../TryOmarchy-arm64-dev.exe .
 
       - name: Validate current release pin
         run: scripts/release/validate-pin.py --require-public "$(sed -n 's/.*releases\/download\/\([^\"]*\).*/\1/p' app/manifest.go)"
@@ -84,6 +91,10 @@ jobs:
       - name: Test launcher on Windows
         working-directory: app
         run: go test ./...
+
+      - name: Test isolated ARM development installer
+        working-directory: app
+        run: go test -tags arm64dev -run 'TestARMDevelopment' ./...
 
   importer:
     timeout-minutes: 20

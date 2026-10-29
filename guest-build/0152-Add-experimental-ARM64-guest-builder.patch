@@ -1,0 +1,2282 @@
+From 5d7fbf89fa646f357603c01a7af26a32237a3c58 Mon Sep 17 00:00:00 2001
+From: Codex <codex@example.invalid>
+Date: Wed, 28 Oct 2026 22:09:44 -0400
+Subject: [PATCH] Add an experimental ARM64 guest builder
+
+---
+ guest/Containerfile-aarch64               |  43 ++
+ guest/build-container.sh                  |  94 ++-
+ guest/build.sh                            |  17 +-
+ guest/packages-aarch64.lock.json          | 684 ++++++++++++++++++++++
+ guest/packages-aarch64.txt                | 116 ++++
+ guest/pacman-aarch64.conf                 |  26 +
+ guest/scripts/configure-rootfs.sh         |   2 +-
+ guest/scripts/finalize-rootfs.sh          |   9 +-
+ guest/scripts/refresh-package-lock.sh     |   2 +-
+ guest/scripts/register-aquamarine.sh      |  13 +-
+ guest/scripts/register-omarchy-runtime.sh |   2 +-
+ guest/scripts/register-pinned-mise.sh     |  20 +-
+ guest/spec-aarch64.json                   | 656 +++++++++++++++++++++
+ guest/spec.json                           |   2 +-
+ guest/tests/test_arm64_build_contract.py  |  67 +++
+ guest/tests/test_build_container_arch.py  | 146 +++++
+ guest/vendor/omarchy-pkgs/LICENSE         |  20 +
+ guest/vendor/omarchy-pkgs/README.md       |   6 +
+ guest/vendor/omarchy-pkgs/pacstrap-docker |  23 +
+ 19 files changed, 1915 insertions(+), 33 deletions(-)
+ create mode 100644 guest/Containerfile-aarch64
+ create mode 100644 guest/packages-aarch64.lock.json
+ create mode 100644 guest/packages-aarch64.txt
+ create mode 100644 guest/pacman-aarch64.conf
+ create mode 100644 guest/spec-aarch64.json
+ create mode 100644 guest/tests/test_arm64_build_contract.py
+ create mode 100644 guest/tests/test_build_container_arch.py
+ create mode 100644 guest/vendor/omarchy-pkgs/LICENSE
+ create mode 100644 guest/vendor/omarchy-pkgs/README.md
+ create mode 100755 guest/vendor/omarchy-pkgs/pacstrap-docker
+
+diff --git a/guest/Containerfile-aarch64 b/guest/Containerfile-aarch64
+new file mode 100644
+index 0000000..4a54f67
+--- /dev/null
++++ b/guest/Containerfile-aarch64
+@@ -0,0 +1,43 @@
++# ARM bootstrap follows the official multi-architecture Omarchy package builder
++# at omacom-io/omarchy-pkgs commit 7e448b90313fea4fb78da9a78607287691d3b241.
++FROM docker.io/alpine@sha256:ee16d92f96db08d9d2d07da48555a27f3a69d8f0759021dbc601195ed0d2b5bd AS bootstrapper
++
++ARG TARGETARCH
++RUN test "$TARGETARCH" = arm64
++
++RUN apk add --no-cache bash curl gnupg pacman-makepkg zstd
++COPY guest/vendor/omarchy-pkgs/pacstrap-docker /usr/local/bin/pacstrap-docker
++RUN chmod 0755 /usr/local/bin/pacstrap-docker
++
++RUN mkdir -p /etc/pacman.d /usr/share/pacman/keyrings && \
++    printf '[options]\nHoldPkg = pacman glibc\nArchitecture = auto\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n\n[alarm]\nInclude = /etc/pacman.d/mirrorlist\n\n[aur]\nInclude = /etc/pacman.d/mirrorlist\n' > /etc/pacman.conf && \
++    printf 'Server = https://arm-mirror.omarchy.org/$arch/$repo\n' | sed 's/\$arch/aarch64/' > /etc/pacman.d/mirrorlist && \
++    for pair in \
++      'archlinuxarm-revoked e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
++      'archlinuxarm-trusted f2a7250f2a2b77542f82f4219b2bae7895f27b3dcfdf350b497e2be306af776d' \
++      'archlinuxarm.gpg 6ce771e853f04a38a5b533cb33e61f877b9b06b58b6db051eb8a15d737a2332f'; do \
++      set -- $pair; \
++      curl -fsSL "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/0b5418fc3f62860b191cd872cb2f933f9fc77841/core/archlinuxarm-keyring/$1" -o "/usr/share/pacman/keyrings/$1"; \
++      echo "$2  /usr/share/pacman/keyrings/$1" | sha256sum -c -; \
++    done && \
++    pacman-key --init && pacman-key --populate archlinuxarm && \
++    mkdir /rootfs && pacstrap-docker /rootfs base archlinuxarm-keyring && \
++    cp /etc/pacman.conf /rootfs/etc/pacman.conf && \
++    cp /etc/pacman.d/mirrorlist /rootfs/etc/pacman.d/mirrorlist
++
++FROM scratch AS builder
++COPY --from=bootstrapper /rootfs/ /
++
++# Import the reviewed Omarchy packaging key; package signatures stay required.
++COPY guest/keys/omarchy-pkgs.asc /tmp/omarchy-pkgs.asc
++RUN pacman-key --init && pacman-key --populate archlinuxarm && \
++    test "$(gpg --batch --with-colons --show-keys /tmp/omarchy-pkgs.asc | awk -F: '/^fpr:/ { print $10; exit }')" = 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
++    pacman-key --add /tmp/omarchy-pkgs.asc && \
++    pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
++    rm /tmp/omarchy-pkgs.asc && \
++    pacman -Syu --noconfirm && \
++    pacman -S --needed --noconfirm arch-install-scripts e2fsprogs gcc git python zstd && \
++    pacman -Scc --noconfirm
++
++WORKDIR /workspace
++ENTRYPOINT ["/workspace/guest/build.sh"]
+diff --git a/guest/build-container.sh b/guest/build-container.sh
+index 643d025..6a97845 100755
+--- a/guest/build-container.sh
++++ b/guest/build-container.sh
+@@ -18,6 +18,11 @@ dry_run=0
+ 
+ while (($#)); do
+   case "$1" in
++    --spec)
++      [[ $# -ge 2 && -n ${2:-} ]] || fail "--spec requires a file"
++      spec=$2
++      shift 2
++      ;;
+     --output)
+       output=${2:-}
+       output_set=1
+@@ -39,7 +44,8 @@ while (($#)); do
+       cat <<'USAGE'
+ Usage: guest/build-container.sh [options]
+ 
+-  --output DIR                   Artifact directory (default: dist/guest)
++  --spec FILE                    Guest spec within guest/ (default: guest/spec.json)
++  --output DIR                   Artifact directory (default: dist/guest or dist/guest-aarch64)
+   --work-volume NAME             Persistent Docker build/cache volume
+   --refresh-package-lock FILE    Resolve the spec transaction to FILE; do not build
+   --dry-run                      Print the selected immutable build plan
+@@ -52,8 +58,12 @@ USAGE
+   esac
+ done
+ 
+-[[ -f $spec ]] || fail "spec not found: $spec"
+-container_spec=/workspace/guest/spec.json
++[[ -n $spec && -f $spec && ! -L $spec ]] || fail "spec not found or is a symlink: $spec"
++spec_dir=$(cd "$(dirname "$spec")" && pwd -P)
++guest_physical_dir=$(cd "$guest_dir" && pwd -P)
++[[ $spec_dir == "$guest_physical_dir" ]] || fail "spec must be in guest/"
++spec="$spec_dir/$(basename "$spec")"
++container_spec="/workspace/guest/$(basename "$spec")"
+ plan_fields=$(python3 - "$spec" <<'PY'
+ import json
+ import pathlib
+@@ -62,30 +72,91 @@ import sys
+ spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+ architecture = spec["image"]["architecture"]
+ profile = spec["guest"].get("profile")
+-if architecture != "x86_64":
+-    raise SystemExit(f"x86 builder requires an x86_64 spec, got {architecture}")
++if architecture not in ("x86_64", "aarch64"):
++    raise SystemExit(f"unsupported guest architecture: {architecture}")
+ if profile != "factory":
+     raise SystemExit(f"native guest requires the factory profile, got {profile}")
+ print(f"{architecture}\t{profile}")
+ PY
+ ) || fail "invalid native guest spec"
+ IFS=$'\t' read -r architecture profile <<<"$plan_fields"
+-[[ -n $architecture && -n $profile ]] || fail "could not read x86_64 build spec"
++[[ -n $architecture && -n $profile ]] || fail "could not read guest build spec"
++case "$architecture" in
++  x86_64)
++    platform=linux/amd64
++    containerfile="$guest_dir/Containerfile"
++    builder_image=try-omarchy-guest-builder
++    ;;
++  aarch64)
++    platform=linux/arm64
++    containerfile="$guest_dir/Containerfile-aarch64"
++    builder_image=try-omarchy-guest-builder-aarch64
++    if ((output_set == 0)); then
++      output="$repo_dir/dist/guest-aarch64"
++    fi
++    ;;
++esac
+ 
+ if [[ -n $refresh_package_lock && $output_set == 1 ]]; then
+   fail "--output and --refresh-package-lock are mutually exclusive"
+ fi
+ 
++# ARM and x86 images use the same artifact names. Refuse to overwrite an
++# existing directory until ARM release packaging has architecture-aware names.
++if [[ $architecture == aarch64 && -z $refresh_package_lock ]]; then
++  [[ ! -L $output && ( ! -e $output || -d $output ) ]] || fail "ARM output must be a new or empty directory"
++  if [[ -d $output ]]; then
++    existing=$(find "$output" -mindepth 1 -maxdepth 1 -print -quit) || fail "cannot inspect ARM output directory"
++    [[ -z $existing ]] || fail "ARM output must be a new or empty directory"
++  fi
++fi
++
++# Protect ARM artifacts when the x86 builder is pointed at their directory.
++if [[ $architecture == x86_64 && -z $refresh_package_lock && -d $output ]]; then
++  if ! python3 - "$output" <<'PYGUARD'
++import json
++from pathlib import Path
++import sys
++
++output = Path(sys.argv[1])
++identified = False
++for filename, section in (("build-spec.json", "image"), ("guest-manifest.json", "guest")):
++    path = output / filename
++    if path.is_symlink():
++        raise SystemExit(f"refusing symlinked guest metadata: {path}")
++    if not path.exists():
++        continue
++    try:
++        architecture = json.loads(path.read_text())[section]["architecture"]
++    except (OSError, ValueError, KeyError, TypeError):
++        raise SystemExit(f"cannot identify guest architecture in {path}")
++    if architecture != "x86_64":
++        raise SystemExit(f"refusing to overwrite {architecture} guest artifacts in {output}")
++    identified = True
++if not identified:
++    for filename in ("rootfs.ext4", "rootfs.ext4.zst", "vmlinuz-linux", "initramfs-linux.img", "SHA256SUMS"):
++        path = output / filename
++        if path.exists() or path.is_symlink():
++            raise SystemExit(f"cannot identify existing guest artifacts in {output}")
++PYGUARD
++  then
++    exit 2
++  fi
++fi
++
+ if [[ -z $work_volume ]]; then
+   repo_checksum=$(printf '%s' "$repo_dir" | cksum)
+   repo_checksum=${repo_checksum%% *}
+   work_volume="try-omarchy-guest-work-$repo_checksum"
++  if [[ $architecture == aarch64 ]]; then
++    work_volume+="-aarch64"
++  fi
+ fi
+ [[ $work_volume =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "invalid Docker volume name: $work_volume"
+ 
+ if (( dry_run )); then
+-  printf 'architecture=%s\nplatform=linux/amd64\nprofile=%s\nspec=%s\noutput=%s\nwork-volume=%s\n' \
+-    "$architecture" "$profile" "$spec" "$output" "$work_volume"
++  printf 'architecture=%s\nplatform=%s\nprofile=%s\nspec=%s\noutput=%s\nwork-volume=%s\n' \
++    "$architecture" "$platform" "$profile" "$spec" "$output" "$work_volume"
+   if [[ -n $refresh_package_lock ]]; then
+     printf 'mode=refresh-package-lock\npackage-lock-output=%s\n' "$refresh_package_lock"
+   else
+@@ -96,8 +167,7 @@ fi
+ 
+ command -v docker >/dev/null || fail "docker is required"
+ 
+-builder_image=try-omarchy-guest-builder
+-docker build --platform linux/amd64 -f "$guest_dir/Containerfile" -t "$builder_image" "$repo_dir"
++docker build --platform "$platform" -f "$containerfile" -t "$builder_image" "$repo_dir"
+ builder_digest=$(docker image inspect --format '{{.Id}}' "$builder_image")
+ 
+ if [[ -n $refresh_package_lock ]]; then
+@@ -106,7 +176,7 @@ if [[ -n $refresh_package_lock ]]; then
+   lock_parent=$(dirname "$refresh_package_lock")
+   mkdir -p "$lock_parent"
+   lock_parent=$(cd "$lock_parent" && pwd)
+-  docker run --rm --platform linux/amd64 \
++  docker run --rm --platform "$platform" \
+     --entrypoint /workspace/guest/scripts/refresh-package-lock.sh \
+     -e OMARCHY_PACMAN_DISABLE_SANDBOX=1 \
+     -v "$repo_dir:/workspace:ro" \
+@@ -119,7 +189,7 @@ fi
+ mkdir -p "$output"
+ output=$(cd "$output" && pwd)
+ docker volume create --label dev.tryomarchy.role=guest-work "$work_volume" >/dev/null
+-docker run --rm --platform linux/amd64 --privileged \
++docker run --rm --platform "$platform" --privileged \
+   -e OMARCHY_BUILDER_IMAGE_DIGEST="$builder_digest" \
+   -e OMARCHY_PACMAN_DISABLE_SANDBOX=1 \
+   -v "$repo_dir:/workspace:ro" \
+diff --git a/guest/build.sh b/guest/build.sh
+index 6cdd032..abd1d3c 100755
+--- a/guest/build.sh
++++ b/guest/build.sh
+@@ -203,7 +203,22 @@ python3 "$guest_dir/scripts/resolve-package-lock.py" \
+ # pacstrap reads configured CacheDir paths for host-cache mode only with -P.
+ # The copied builder config is replaced by configure-rootfs below. Archives
+ # remain under $work across failed staging roots and are still signature-checked.
+-pacstrap -c -P -C "$pacman_config" -K -M "$root" "${packages[@]}"
++if [[ $architecture == aarch64 ]]; then
++  # Initialize a new guest keyring, then populate both reviewed signing keys.
++  # Arch Linux ARM has a different keyring from the x86 builder.
++  install -d -m 0755 "$root/etc/pacman.d"
++  pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --init
++  pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --populate archlinuxarm
++  omarchy_key="$guest_dir/keys/omarchy-pkgs.asc"
++  omarchy_fingerprint=40DFB630FF42BCFFB047046CF0134EE680CAC571
++  [[ $(gpg --batch --with-colons --show-keys "$omarchy_key" | awk -F: '/^fpr:/ { print $10; exit }') == "$omarchy_fingerprint" ]] \
++    || fail "Omarchy packaging key fingerprint mismatch"
++  pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --add "$omarchy_key"
++  pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --lsign-key "$omarchy_fingerprint"
++  pacstrap -c -P -C "$pacman_config" -G -M "$root" "${packages[@]}"
++else
++  pacstrap -c -P -C "$pacman_config" -K -M "$root" "${packages[@]}"
++fi
+ 
+ # Fail before image packing if the repository's prebuilt Quickshell and the
+ # reviewed Qt private ABI set cannot actually load together.
+diff --git a/guest/packages-aarch64.lock.json b/guest/packages-aarch64.lock.json
+new file mode 100644
+index 0000000..27ccd0d
+--- /dev/null
++++ b/guest/packages-aarch64.lock.json
+@@ -0,0 +1,684 @@
++{
++  "architecture": "aarch64",
++  "packages": {
++    "abseil-cpp": "20260817.0-2",
++    "acl": "2.4.0-1",
++    "adwaita-cursors": "51.0-1",
++    "adwaita-fonts": "51.0-2",
++    "adwaita-icon-theme": "51.0-1",
++    "adwaita-icon-theme-legacy": "46.2-3",
++    "alsa-card-profiles": "1:1.6.10-1",
++    "alsa-lib": "1.2.16.1-1",
++    "alsa-topology-conf": "1.2.5.1-4",
++    "alsa-ucm-conf": "1.2.16.1-1",
++    "aom": "3.15.2-1",
++    "aquamarine": "0.15.1-1.3",
++    "archlinux-keyring": "20260909-1",
++    "archlinuxarm-keyring": "20240419-2",
++    "at-spi2-core": "2.62.1-1",
++    "attr": "2.6.0-1",
++    "audit": "4.2.1-1",
++    "autoconf": "2.73-1",
++    "automake": "1.19-1",
++    "avahi": "1:0.9rc5-2",
++    "base": "3-3",
++    "base-devel": "1-2",
++    "bash": "5.3.20-1",
++    "bash-completion": "2.18.0-1",
++    "bat": "0.26.1-3",
++    "benchmark": "1.10.0-1",
++    "binutils": "2.46+r70+g155188ea10a7-1",
++    "bison": "3.8.2-8",
++    "bluez-libs": "5.87-2",
++    "boost-libs": "1.92.0-1",
++    "brotli": "1.2.1-1",
++    "btop": "1.4.7-1",
++    "bubblewrap": "0.13.1-1",
++    "bzip2": "1.0.8-6",
++    "ca-certificates": "20240618-1",
++    "ca-certificates-mozilla": "3.132-1",
++    "ca-certificates-utils": "20240618-1",
++    "cairo": "1.18.6-1",
++    "chromium": "153.0.8010.36-1",
++    "clang": "23.1.4-1.1",
++    "clang-libs": "23.1.4-1.1",
++    "cmake": "4.4.5-1",
++    "compiler-rt": "23.1.4-1.1",
++    "coreutils": "9.12-2",
++    "cpio": "2.15-3",
++    "cppdap": "1.58.0-3",
++    "cpptrace": "1.0.4-2",
++    "cryptsetup": "2.8.8-1",
++    "curl": "8.23.0-1",
++    "dav1d": "1.5.4-1",
++    "db5.3": "5.3.28-7",
++    "dbus": "1.16.2-2",
++    "dbus-broker": "37-3",
++    "dbus-broker-units": "37-3",
++    "dbus-units": "37-3",
++    "dconf": "51.0-1",
++    "debugedit": "5.3-2",
++    "default-cursors": "3-1",
++    "desktop-file-utils": "0.28-1",
++    "device-mapper": "2.03.43-2",
++    "diffutils": "3.12-2",
++    "dkms": "3.4.4-1",
++    "double-conversion": "3.4.0-1",
++    "dua-cli": "2.46.0-1",
++    "duktape": "2.7.0-7",
++    "e2fsprogs": "1.47.4-1",
++    "elfutils": "0.197-1",
++    "enchant": "2.8.21-1",
++    "exempi": "2.6.6-3",
++    "exiv2": "0.28.9-1",
++    "expat": "2.9.0-1",
++    "eza": "0.23.5-2",
++    "fakeroot": "1:1.37.2-3",
++    "fastfetch": "2.70.0-1",
++    "fcft": "3.3.3-1",
++    "fcitx5": "5.1.23-1",
++    "fcitx5-chewing": "5.1.13-1",
++    "fcitx5-gtk": "5.1.7-1",
++    "fcitx5-qt": "5.1.16-2",
++    "fd": "10.5.0-3",
++    "ffmpeg": "2:9.0.2-2",
++    "fftw": "3.3.11-1",
++    "file": "5.48-1",
++    "filesystem": "2025.10.12-1",
++    "findutils": "4.11.0-1",
++    "flac": "1.5.0-1",
++    "flex": "2.6.4-6",
++    "fontconfig": "2:2.18.3-2",
++    "foot": "1.28.0-2",
++    "freetype2": "2.15.0-1",
++    "fribidi": "1.0.17-1",
++    "fuse-common": "3.18.3-1",
++    "fuse3": "3.18.3-1",
++    "fzf": "0.74.5-1",
++    "gawk": "5.4.1-1",
++    "gc": "8.2.12-1",
++    "gcc": "16.1.1+r12+g301eb08fa2c5-1",
++    "gcc-libs": "16.1.1+r12+g301eb08fa2c5-1",
++    "gcr": "3.41.2-2",
++    "gcr-4": "4.4.1-1",
++    "gd": "2.3.3-9",
++    "gdb": "18.1-1",
++    "gdb-common": "18.1-1",
++    "gdbm": "1.26-2",
++    "gdk-pixbuf2": "2.44.8-1",
++    "gettext": "1.0-2",
++    "gexiv2": "0.16.2-2",
++    "gexiv2-common": "0.16.2-2",
++    "ghostscript": "10.08.0-1",
++    "giflib": "6.1.3-2",
++    "git": "2.56.0-1",
++    "glib-networking": "1:2.90.1-1",
++    "glib2": "2.90.1-1",
++    "glibc": "2.43+r22+g8362e8ce10b2-2",
++    "glslang": "1:1.4.363.0-1",
++    "glu": "9.0.3-3",
++    "glycin": "2.2.5-1",
++    "glycin-gtk4": "2.2.5-1",
++    "gmp": "6.3.0-3",
++    "gnome-autoar": "0.5.2-1",
++    "gnome-desktop-4": "1:51.0-1",
++    "gnome-desktop-common": "1:51.0-1",
++    "gnome-keyring": "1:51.1-1",
++    "gnulib-l10n": "20241231-1",
++    "gnupg": "2.4.9-3",
++    "gnutls": "3.8.13-3",
++    "gobject-introspection-runtime": "1.86.0-2",
++    "gperftools": "2.19.1-1",
++    "gpgme": "2.2.0-1",
++    "gpgmepp": "2.2.0-1",
++    "gpm": "1.20.7.r38.ge82d1a6-7",
++    "gpu-screen-recorder": "6.1.6-1",
++    "graphene": "1.10.8-2.1",
++    "graphicsmagick": "1.3.49-3",
++    "graphite": "1:1.3.15-1",
++    "graphviz": "16.1.0-2",
++    "grep": "3.12-2",
++    "grim": "1.5.0-2",
++    "groff": "1.24.2-1",
++    "gsettings-desktop-schemas": "51.0-1",
++    "gsettings-system-schemas": "51.0-1",
++    "gsfonts": "20200910-6",
++    "gsm": "1.0.24-1",
++    "gssdp": "1.6.6-1",
++    "gst-plugins-bad-libs": "1.28.8-1",
++    "gst-plugins-base-libs": "1.28.8-1",
++    "gstreamer": "1.28.8-1",
++    "gtest": "1.18.0-1",
++    "gtk-update-icon-cache": "1:4.24.1-1",
++    "gtk3": "1:3.24.52-2",
++    "gtk4": "1:4.24.1-1",
++    "gtk4-layer-shell": "1.3.0-1",
++    "gts": "0.7.6.121130-5",
++    "guile": "3.0.11-1",
++    "gum": "2.0.2-1",
++    "gupnp": "1:1.6.10-1",
++    "gupnp-dlna": "0.12.0-5",
++    "gupnp-igd": "1.6.0-2",
++    "gvfs": "1.62.0-3",
++    "gzip": "1.15-1",
++    "harfbuzz": "15.0.0-1",
++    "herdr": "0.9.1-2",
++    "hicolor-icon-theme": "0.18-1",
++    "hidapi": "0.15.0-1",
++    "highway": "1.4.0-1",
++    "hwdata": "0.412-1",
++    "hyprcursor": "0.1.13-7",
++    "hyprgraphics": "0.5.1-4",
++    "hypridle": "0.1.8-2",
++    "hyprland": "0.56.2-7",
++    "hyprland-guiutils": "0.2.2-4",
++    "hyprland-preview-share-picker": "0.2.1-3",
++    "hyprlang": "0.6.8-5",
++    "hyprpicker": "0.4.7-4",
++    "hyprsunset": "0.4.0-3",
++    "hyprtoolkit": "0.6.0-1",
++    "hyprutils": "0.14.3-1",
++    "hyprwayland-scanner": "0.4.6-1",
++    "hyprwire": "0.3.1-3",
++    "iana-etc": "20260617-1",
++    "icu": "78.3-1",
++    "ijs": "0.35-7",
++    "imagemagick": "7.1.2.34-2",
++    "imv": "5.0.1-2",
++    "iniparser": "4.3.2-1",
++    "inotify-tools": "4.26.270-1",
++    "iproute2": "7.3.0-1",
++    "iptables": "1:1.8.13-1",
++    "iputils": "20250605-1",
++    "iso-codes": "4.20.1-1",
++    "jack2": "1.9.22-2",
++    "jansson": "2.15.1-1",
++    "jbig2dec": "0.20-1",
++    "jbigkit": "2.2-1",
++    "jemalloc": "1:5.4.0-1",
++    "jq": "1.8.2-1",
++    "json-c": "0.19-1",
++    "json-glib": "1.10.8-1",
++    "jsoncpp": "1.9.8-1",
++    "kbd": "2.10.0-1",
++    "keyutils": "1.6.3-4",
++    "kmod": "34.2-1",
++    "krb5": "1.22.2-1",
++    "l-smash": "2.14.5-4",
++    "lame": "4.0-1",
++    "lcms2": "2.19.1-1",
++    "leancrypto": "1.9.1-1",
++    "leptonica": "1.87.0-2",
++    "less": "1:710-1",
++    "libadwaita": "1:1.10.0-1",
++    "libarchive": "3.8.10-1",
++    "libasan": "16.1.1+r12+g301eb08fa2c5-1",
++    "libass": "0.17.5-1",
++    "libassuan": "3.0.0-1",
++    "libasyncns": "1:0.8+r3+g68cd5af-3",
++    "libatasmart": "0.19-8",
++    "libatomic": "16.1.1+r12+g301eb08fa2c5-1",
++    "libavc1394": "0.5.4-7",
++    "libavif": "1.4.2-1",
++    "libb2": "0.98.1-3",
++    "libblockdev": "3.5.0-2",
++    "libblockdev-crypto": "3.5.0-2",
++    "libblockdev-fs": "3.5.0-2",
++    "libblockdev-loop": "3.5.0-2",
++    "libblockdev-mdraid": "3.5.0-2",
++    "libblockdev-nvme": "3.5.0-2",
++    "libblockdev-part": "3.5.0-2",
++    "libblockdev-smart": "3.5.0-2",
++    "libblockdev-swap": "3.5.0-2",
++    "libbluray": "1.5.1-1",
++    "libbpf": "1.7.0-1",
++    "libbs2b": "3.1.0-11",
++    "libbsd": "0.12.2-2",
++    "libbytesize": "2.12-3",
++    "libcap": "2.78-1",
++    "libcap-ng": "0.9.6-1",
++    "libcdio": "2.4.0-1",
++    "libcdio-paranoia": "10.2+2.0.2-3",
++    "libchewing": "0.13.1-1",
++    "libcloudproviders": "0.4.1-1",
++    "libcolord": "1.4.8-2",
++    "libcue": "2.3.0-1",
++    "libcups": "2:2.4.20-1",
++    "libdaemon": "0.14-6",
++    "libdatrie": "0.2.14-1",
++    "libde265": "1.1.3-1",
++    "libdecor": "0.2.5-1",
++    "libdeflate": "1.26-1",
++    "libdisplay-info": "0.3.0-1",
++    "libdovi": "3.4.0-1",
++    "libdrm": "2.4.134-1",
++    "libdvdnav": "7.0.0-1",
++    "libdvdread": "7.1.1-1",
++    "libdwarf": "1:2.3.3-1",
++    "libebur128": "1.2.6-2",
++    "libedit": "20260512_3.1-1",
++    "libei": "1.6.0-2",
++    "libelf": "0.197-1",
++    "libepoxy": "1.5.10-3",
++    "libevdev": "1.14.0-1",
++    "libevent": "2.1.13-2",
++    "libexif": "0.6.26-1",
++    "libfdk-aac": "3.0.0-1",
++    "libffi": "3.8.0-1",
++    "libfontenc": "1.1.9-1",
++    "libfreeaptx": "0.2.2-1",
++    "libgcc": "16.1.1+r12+g301eb08fa2c5-1",
++    "libgcrypt": "1.12.4-1",
++    "libgfortran": "16.1.1+r12+g301eb08fa2c5-1",
++    "libgirepository": "1.86.0-2",
++    "libgit2": "1:1.9.7-1",
++    "libglvnd": "1.7.0-3",
++    "libgomp": "16.1.1+r12+g301eb08fa2c5-1",
++    "libgpg-error": "1.61-1",
++    "libgsf": "1.14.60-1",
++    "libgudev": "238-4",
++    "libgxps": "0.3.2-5",
++    "libheif": "1.23.7-1",
++    "libice": "1.1.2-1",
++    "libidn": "1.44-1",
++    "libidn2": "2.3.8-1",
++    "libiec61883": "1.2.0-9",
++    "libimobiledevice": "1.4.0-2",
++    "libimobiledevice-glue": "1.3.2-1",
++    "libinih": "62-2",
++    "libinput": "1.32.0-1",
++    "libiptcdata": "1.0.5-5",
++    "libisl": "0.28-1",
++    "libjpeg-turbo": "3.2.0-2",
++    "libjxl": "0.12.0-1",
++    "libksba": "1.8.1-1",
++    "liblc3": "1.1.3-2",
++    "libldac": "2.0.2.6-1",
++    "libldap": "2.7.2-2",
++    "liblqr": "0.4.3-1",
++    "liblsan": "16.1.1+r12+g301eb08fa2c5-1",
++    "libluv": "1.52.1-1",
++    "libmakepkg-dropins": "20-2",
++    "libmd": "1.3.0-1",
++    "libmediainfo": "26.10-1",
++    "libmm-glib": "1.24.2-2",
++    "libmms": "0.6.4-6",
++    "libmnl": "1.0.5-2",
++    "libmodplug": "0.8.9.0-7",
++    "libmpc": "1.4.1-1",
++    "libmysofa": "1.3.5-1",
++    "libnautilus-extension": "51.1-1",
++    "libndp": "1.9-1",
++    "libnetfilter_conntrack": "1.1.1-1",
++    "libnewt": "0.52.25-2",
++    "libnfnetlink": "1.0.2-2",
++    "libnftnl": "1.3.2-1",
++    "libnghttp2": "1.70.0-1",
++    "libnghttp3": "1.18.0-1",
++    "libngtcp2": "1.25.0-1",
++    "libnice": "0.1.24-1",
++    "libnl": "3.12.0-1",
++    "libnm": "1.58.1-2",
++    "libnotify": "0.8.9-1",
++    "libnsbmp": "0.1.7-2",
++    "libnsgif": "1.0.0-2",
++    "libnsl": "2.0.1-2",
++    "libnvme": "1.16.2-2",
++    "libobjc": "16.1.1+r12+g301eb08fa2c5-1",
++    "libogg": "1.3.6-1",
++    "libopenmpt": "0.8.9-1",
++    "libosinfo": "1.12.0-3",
++    "libp11-kit": "0.26.5-1",
++    "libpaper": "2.2.8-1",
++    "libpcap": "1.11.0-1",
++    "libpciaccess": "0.19-1",
++    "libpgm": "5.3.128-4",
++    "libpipeline": "1.5.8-1",
++    "libpipewire": "1:1.6.10-1",
++    "libplacebo": "7.360.1-7",
++    "libplist": "2.7.0-3",
++    "libpng": "1.6.59-1",
++    "libportal": "0.11.0-1",
++    "libportal-gtk4": "0.11.0-1",
++    "libproxy": "0.5.12-1",
++    "libpsl": "0.21.5-2",
++    "libpulse": "17.0+r134+g77d25a1e6-1",
++    "libquadmath": "16.1.1+r12+g301eb08fa2c5-1",
++    "libraqm": "0.11.0-1",
++    "libraw1394": "2.1.2-4",
++    "librsvg": "2:2.63.4-1",
++    "libsamplerate": "0.2.2-3",
++    "libsasl": "2.1.28-5",
++    "libseccomp": "2.6.0-1",
++    "libsecret": "0.21.8.2-1",
++    "libsixel": "1.10.5-1",
++    "libsm": "1.2.6-1",
++    "libsndfile": "1.2.2-4",
++    "libsodium": "1.0.22-1",
++    "libsoup3": "3.8.1-1",
++    "libsoxr": "0.1.3-5",
++    "libssh": "0.12.2-1",
++    "libssh2": "1.11.1-7",
++    "libstdc++": "16.1.1+r12+g301eb08fa2c5-1",
++    "libstemmer": "3.1.1-1",
++    "libsysprof-capture": "51.0-1",
++    "libtasn1": "4.21.0-1",
++    "libtatsu": "1.0.5-1",
++    "libteam": "1.32-3",
++    "libthai": "0.1.30-1",
++    "libtheora": "1.2.0-1",
++    "libtiff": "4.7.2-2",
++    "libtirpc": "1.3.8-1",
++    "libtool": "2.6.0+r23+gb08cb0a0-1",
++    "libtsan": "16.1.1+r12+g301eb08fa2c5-1",
++    "libubsan": "16.1.1+r12+g301eb08fa2c5-1",
++    "libunibreak": "7.0-1",
++    "libunistring": "1.4.2-1",
++    "libunwind": "1.8.3-1",
++    "liburing": "2.15-1",
++    "libusb": "1.0.30-1",
++    "libusbmuxd": "2.1.1-2",
++    "libutempter": "1.2.3-1",
++    "libutf8proc": "2.12.0-1",
++    "libuv": "1.53.0-1",
++    "libva": "2.24.1-1",
++    "libvdpau": "1.5-4",
++    "libverto": "0.3.2-6",
++    "libvorbis": "1.3.7-4",
++    "libvpx": "1.17.0-1",
++    "libvterm": "0.3.3-2",
++    "libwacom": "2.20.0-1",
++    "libwebp": "1.6.0-2",
++    "libwireplumber": "0.5.18-1",
++    "libx11": "1.8.14-1",
++    "libxau": "1.0.12-1",
++    "libxcb": "1.17.0-1",
++    "libxcomposite": "0.4.7-1",
++    "libxcrypt": "4.5.2-1",
++    "libxcursor": "1.2.3-1",
++    "libxcvt": "0.1.3-1",
++    "libxdamage": "1.1.7-1",
++    "libxdmcp": "1.1.5-2",
++    "libxext": "1.3.7-1",
++    "libxfixes": "6.0.2-1",
++    "libxfont2": "2.0.9-1",
++    "libxft": "2.3.9-1",
++    "libxi": "1.8.4-1",
++    "libxinerama": "1.1.6-1",
++    "libxkbcommon": "1.13.2-1",
++    "libxkbcommon-x11": "1.13.2-1",
++    "libxkbfile": "1.2.0-1",
++    "libxml2": "2.15.4-1",
++    "libxmu": "1.3.1-1",
++    "libxpm": "3.5.20-1",
++    "libxpresent": "1.0.2-1",
++    "libxrandr": "1.5.5-1",
++    "libxrender": "0.9.13-1",
++    "libxshmfence": "1.3.3-1",
++    "libxslt": "1.1.45-2",
++    "libxss": "1.2.5-1",
++    "libxt": "1.3.1-1",
++    "libxtst": "1.2.6-1",
++    "libxv": "1.0.13-1",
++    "libxxf86vm": "1.1.7-1",
++    "libyaml": "0.2.5-3",
++    "libyuv": "r2921+644251f25-1",
++    "libzen": "0.4.41-3",
++    "libzip": "1.11.4-1",
++    "licenses": "20240728-1",
++    "lilv": "0.28.0-1",
++    "linux-aarch64": "7.3-1",
++    "linux-aarch64-headers": "7.3-1",
++    "linux-api-headers": "7.3-1",
++    "llhttp": "9.3.1-1",
++    "llvm": "23.1.4-1.1",
++    "llvm-libs": "23.1.4-1.1",
++    "llvm-lit": "23.1.4-1.1",
++    "lm_sensors": "1:3.6.2-1",
++    "lmdb": "0.9.35-1",
++    "localsearch": "3.12.0-1",
++    "lua": "5.5.1-1",
++    "lua51-lpeg": "1.1.0-5",
++    "lua54": "5.4.9-1",
++    "luajit": "2.1.1792588164+a4c0645-1",
++    "lv2": "1.18.10-2",
++    "lz4": "1:1.10.0-2",
++    "lzo": "2.10-5",
++    "m4": "1.4.21-2",
++    "make": "4.4.1-3",
++    "man-db": "2.13.1-2",
++    "md4c": "0.6.0-2",
++    "mdadm": "4.6-2",
++    "mesa": "1:26.2.5-1",
++    "ministream": "0.99.1-1",
++    "minizip": "1:1.3.2-4",
++    "mkinitcpio": "42.2-1",
++    "mkinitcpio-busybox": "1.36.1-1",
++    "mobile-broadband-provider-info": "20251101-1",
++    "mpdecimal": "4.0.1-3",
++    "mpfr": "4.2.2-1",
++    "mpg123": "1.33.7-1",
++    "mpv": "1:0.41.0-6",
++    "msgpack-c": "7.0.2-1",
++    "mtdev": "1.1.7-1",
++    "mujs": "1.3.11-1",
++    "muparser": "2.3.5-2",
++    "nautilus": "51.1-1",
++    "ncurses": "6.6-2",
++    "neovim": "0.12.6-1",
++    "netpbm": "10.86.51-2",
++    "nettle": "4.0-1",
++    "networkmanager": "1.58.1-2",
++    "nftables": "1:1.1.7-3",
++    "noto-fonts": "1:2026.10.01-1",
++    "noto-fonts-cjk": "20240730-1",
++    "noto-fonts-emoji": "1:2.057-1",
++    "npth": "1.8-1",
++    "nspr": "4.40-1",
++    "nss": "3.132-1",
++    "numactl": "2.0.19-1",
++    "ocl-icd": "2.3.5-1",
++    "omacalc": "0.3.1-1",
++    "omacut": "0.7.2-1",
++    "omarchy-keyring": "20251027-1",
++    "omarchy-nvim": "2026.9.21-5",
++    "omawrite": "0.7.2-1",
++    "oniguruma": "6.9.10-3",
++    "openal": "1.25.2-2",
++    "opencore-amr": "0.1.6-2",
++    "openh264": "2.7.0-1",
++    "openjpeg2": "2.5.4-1",
++    "openssh": "10.6p1-2",
++    "openssl": "3.6.5-1",
++    "opus": "1.6.1-1",
++    "orc": "0.4.44-1",
++    "osinfo-db": "20260812-1",
++    "p11-kit": "0.26.5-1",
++    "pacman": "7.1.0.r9.g54d9411-3",
++    "pacman-contrib": "1.13.1-1",
++    "pacman-mirrorlist": "20260411-2",
++    "pam": "1.7.3-1",
++    "pambase": "20260616-1",
++    "pamixer": "1.6-3",
++    "pango": "1:1.58.2-1",
++    "parted": "3.8-1",
++    "patch": "2.8.1-1",
++    "pciutils": "3.15.0-1",
++    "pcre": "8.45-5",
++    "pcre2": "10.49-1",
++    "pcsclite": "2.5.3-1",
++    "perl": "5.44.0-1",
++    "perl-error": "0.17031-1",
++    "perl-mailtools": "2.22-3",
++    "perl-timedate": "2.35-1",
++    "pinentry": "1.3.3-1",
++    "pipewire": "1:1.6.10-1",
++    "pipewire-alsa": "1:1.6.10-1",
++    "pipewire-audio": "1:1.6.10-1",
++    "pipewire-pulse": "1:1.6.10-1",
++    "pixman": "0.46.4-1.1",
++    "pkgconf": "3.0.10-1",
++    "playerctl": "2.4.1-5",
++    "plocate": "1.1.25-1",
++    "polkit": "128-1",
++    "poppler": "26.10.0-1",
++    "poppler-data": "0.4.12-2",
++    "poppler-glib": "26.10.0-1",
++    "popt": "1.19-2",
++    "portaudio": "1:19.7.0-4",
++    "procps-ng": "4.0.7-1",
++    "psmisc": "23.7-2",
++    "pugixml": "1.16-1",
++    "python": "3.14.8-1",
++    "python-dbus": "1.5.1-1",
++    "python-docopt": "0.6.2-16",
++    "python-gobject": "3.58.1-1",
++    "python-pyxdg": "0.28-8",
++    "python-yaml": "6.0.3-2",
++    "qoi": "r350.4461cc3-1",
++    "qrencode": "4.1.1-4",
++    "qt6-base": "6.12.0-3",
++    "qt6-declarative": "6.12.0-3",
++    "qt6-multimedia": "6.12.0-1",
++    "qt6-multimedia-ffmpeg": "6.12.0-1",
++    "qt6-svg": "6.12.0-1",
++    "qt6-translations": "6.12.0-1",
++    "qt6-wayland": "6.12.0-1",
++    "quickshell": "0.3.2.r7.g2b4501a-5",
++    "rav1e": "0.8.1-3",
++    "re2": "2:2025.11.05-6",
++    "readline": "8.3.6-1",
++    "rhash": "1.4.6-1",
++    "ripgrep": "15.2.0-1",
++    "rubberband": "4.0.0-2",
++    "sbc": "2.2-1",
++    "sdbus-cpp": "2.3.1-1",
++    "sddm": "0.21.0-7",
++    "sdl2-compat": "2.32.74-1",
++    "sdl3": "3.4.18-1",
++    "seatd": "0.9.3-1",
++    "sed": "4.10-2",
++    "serd": "0.32.10-1",
++    "shaderc": "2026.4-1",
++    "shadow": "4.20.0.arch1-1",
++    "shared-mime-info": "2.5.1-2",
++    "slang": "2.3.3-4",
++    "slurp": "1.5.0-2",
++    "snappy": "1.3.1-1",
++    "sndio": "1.10.0-1",
++    "socat": "1.8.1.3-1",
++    "sord": "0.16.22-1",
++    "source-highlight": "3.1.9-19",
++    "spandsp": "0.0.6-7",
++    "speex": "1.2.1-3",
++    "speexdsp": "1.2.1-3",
++    "spirv-tools": "1:1.4.363.0-1",
++    "sqlite": "3.54.0-1",
++    "sratom": "0.6.22-1",
++    "srt": "1.5.7-2",
++    "starship": "1.27.0-1",
++    "sudo": "1.9.17.p2-6",
++    "systemd": "262.1-1",
++    "systemd-libs": "262.1-1",
++    "systemd-resolvconf": "262.1-1",
++    "systemd-sysvcompat": "262.1-1",
++    "tar": "1.35-5",
++    "tensaku": "0.29.0-2",
++    "tesseract": "5.5.4-1",
++    "tesseract-data-eng": "2:4.1.0-5",
++    "tesseract-data-osd": "2:4.1.0-5",
++    "texinfo": "7.3-3",
++    "tinysparql": "3.12.0-1",
++    "tinyxml2": "11.0.0-2",
++    "tmux": "3.8-1",
++    "tomlplusplus": "3.4.0-1",
++    "totem-pl-parser": "3.26.7-1",
++    "tpm2-tss": "4.2.0-2",
++    "tree-sitter": "0.26.9-1",
++    "tree-sitter-c": "0.24.1-2",
++    "tree-sitter-lua": "0.5.0-3",
++    "tree-sitter-markdown": "0.5.3-2",
++    "tree-sitter-query": "0.8.0-2",
++    "tree-sitter-vim": "0.8.1-3",
++    "tree-sitter-vimdoc": "4.1.0-2",
++    "tslib": "1.24-1",
++    "ttf-jetbrains-mono-nerd": "3.5.1-2",
++    "ttf-liberation": "2.1.5-2",
++    "ttfx": "0.5.1-1",
++    "tzdata": "2026e-1",
++    "uchardet": "0.0.8-4",
++    "udiskie": "2.7.0-2",
++    "udisks2": "2.11.2-1",
++    "unibilium": "2.1.4-1",
++    "unzip": "6.0-23",
++    "upower": "1.91.5-1",
++    "util-linux": "2.42.4-1",
++    "util-linux-libs": "2.42.4-1",
++    "uwsm": "0.27.1-1",
++    "v4l-utils": "1.32.0-2",
++    "v4l2loopback-dkms": "0.15.4-2",
++    "vapoursynth": "81-1",
++    "vid.stab": "1.1.2-1",
++    "vmaf": "3.2.1-1",
++    "volume_key": "0.3.12-12",
++    "vulkan-icd-loader": "1.4.363.0-1",
++    "vulkan-mesa-implicit-layers": "1:26.2.5-1",
++    "vulkan-swrast": "1:26.2.5-1",
++    "vulkan-virtio": "1:26.2.5-1",
++    "wayland": "1.26.0-1",
++    "wayland-protocols": "1.49-1",
++    "webrtc-audio-processing-1": "1.3-6",
++    "which": "2.25-1",
++    "wireplumber": "0.5.18-1",
++    "wl-clipboard": "1:2.3.0-1",
++    "woff2-font-awesome": "7.3.1-1",
++    "wpa_supplicant": "2:2.12-1",
++    "wtype": "0.4-2",
++    "x264": "3:0.165.r3222.b35605a-2",
++    "x265": "4.3-1",
++    "xcb-imdkit": "1.0.9-1",
++    "xcb-proto": "1.17.0-4",
++    "xcb-util": "0.4.1-2",
++    "xcb-util-cursor": "0.1.6-1",
++    "xcb-util-errors": "1.0.1-2",
++    "xcb-util-image": "0.4.1-3",
++    "xcb-util-keysyms": "0.4.1-5",
++    "xcb-util-renderutil": "0.3.10-2",
++    "xcb-util-wm": "0.4.2-2",
++    "xdg-desktop-portal": "1.22.1-2",
++    "xdg-desktop-portal-gtk": "1.15.3-2",
++    "xdg-desktop-portal-hyprland": "1.4.1-2",
++    "xdg-terminal-exec": "0.14.3-2",
++    "xdg-user-dirs": "0.20-1",
++    "xdg-user-dirs-gtk": "0.16-1",
++    "xdg-utils": "1.2.1-2",
++    "xf86-input-libinput": "1.5.0-1",
++    "xkeyboard-config": "2.48-1",
++    "xorg-fonts-encodings": "1.1.0-2",
++    "xorg-server": "21.1.25-2",
++    "xorg-server-common": "21.1.25-2",
++    "xorg-setxkbmap": "1.3.5-1",
++    "xorg-xauth": "1.1.5-1",
++    "xorg-xkbcomp": "1.5.0-1",
++    "xorg-xprop": "1.2.8-1",
++    "xorg-xwayland": "24.1.14-1",
++    "xorgproto": "2026.1-1",
++    "xvidcore": "1.3.7-4",
++    "xxhash": "0.8.4-1",
++    "xz": "5.8.4-1",
++    "yay": "13.1.0-1",
++    "yoga": "3.2.1-1",
++    "yyjson": "0.13.0-1",
++    "zbar": "0.23.95-1",
++    "zeromq": "4.3.5-3",
++    "zimg": "3.0.6-2",
++    "zix": "0.8.2-1",
++    "zlib": "1:1.3.2-4",
++    "zlib-ng": "2.3.3-1",
++    "zoxide": "0.10.0-1",
++    "zram-generator": "1.2.1-1",
++    "zstd": "1.5.7-3"
++  },
++  "requestedFileSha256": "d4921f45f140f5b7538b9692355ce4d0b92471f3b65fcb19b51baa8bf5345f1c",
++  "schemaVersion": 1
++}
+diff --git a/guest/packages-aarch64.txt b/guest/packages-aarch64.txt
+new file mode 100644
+index 0000000..74e9656
+--- /dev/null
++++ b/guest/packages-aarch64.txt
+@@ -0,0 +1,116 @@
++# aarch64 transaction for the real Quattro first-boot owner-provisioning flow.
++archlinuxarm-keyring
++base
++base-devel
++bash-completion
++bat
++btop
++chromium
++clang
++coreutils
++dbus
++desktop-file-utils
++dua-cli
++e2fsprogs
++eza
++fastfetch
++fcitx5
++fcitx5-chewing
++fcitx5-gtk
++fcitx5-qt
++fd
++fontconfig
++foot
++fzf
++git
++gnome-keyring
++gpu-screen-recorder
++gtk4
++grim
++gum
++gvfs
++herdr
++hypridle
++hyprland
++hyprland-preview-share-picker
++hyprpicker
++hyprsunset
++imagemagick
++imv
++inotify-tools
++jq
++less
++libnotify
++libsecret
++linux-aarch64
++linux-aarch64-headers
++man-db
++mesa
++mkinitcpio
++mpv
++nautilus
++neovim
++networkmanager
++noto-fonts
++noto-fonts-cjk
++noto-fonts-emoji
++omacalc
++omacut
++omarchy-keyring
++omarchy-nvim
++omawrite
++pacman-contrib
++pamixer
++pipewire
++pipewire-alsa
++pipewire-pulse
++playerctl
++plocate
++polkit
++python
++python-gobject
++qrencode
++qt6-wayland
++quickshell
++ripgrep
++sddm
++sed
++shared-mime-info
++slurp
++socat
++starship
++sudo
++systemd
++systemd-resolvconf
++tensaku
++tesseract
++tesseract-data-eng
++tmux
++ttf-jetbrains-mono-nerd
++ttfx
++udiskie
++unzip
++uwsm
++v4l2loopback-dkms
++vulkan-swrast
++vulkan-virtio
++wayland
++wireplumber
++wl-clipboard
++woff2-font-awesome
++wtype
++xdg-desktop-portal-gtk
++xdg-desktop-portal-hyprland
++xdg-terminal-exec
++xdg-user-dirs
++xdg-utils
++xorg-xwayland
++yay
++zbar
++zoxide
++zram-generator
++zstd
++
++# Locked build tools for the managed aquamarine rebuild
++cmake
++hyprwayland-scanner
+diff --git a/guest/pacman-aarch64.conf b/guest/pacman-aarch64.conf
+new file mode 100644
+index 0000000..824a832
+--- /dev/null
++++ b/guest/pacman-aarch64.conf
+@@ -0,0 +1,26 @@
++# Architecture-specific repository configuration for the ARM64 guest.
++[options]
++HoldPkg = pacman glibc
++# Keep the guest modules matched to the externally delivered kernel.
++IgnorePkg = linux-aarch64
++Architecture = auto
++CheckSpace
++ParallelDownloads = 5
++DownloadUser = alpm
++SigLevel = Required DatabaseOptional
++LocalFileSigLevel = Optional
++
++[omarchy]
++Server = https://pkgs.omarchy.org/edge/$arch
++
++[core]
++Server = https://arm-mirror.omarchy.org/$arch/$repo
++
++[extra]
++Server = https://arm-mirror.omarchy.org/$arch/$repo
++
++[alarm]
++Server = https://arm-mirror.omarchy.org/$arch/$repo
++
++[aur]
++Server = https://arm-mirror.omarchy.org/$arch/$repo
+diff --git a/guest/scripts/configure-rootfs.sh b/guest/scripts/configure-rootfs.sh
+index d0bcf42..280dda3 100755
+--- a/guest/scripts/configure-rootfs.sh
++++ b/guest/scripts/configure-rootfs.sh
+@@ -53,7 +53,7 @@ esac
+ 
+ architecture=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["architecture"])' "$spec")
+ profile=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["guest"].get("profile"))' "$spec")
+-[[ $architecture == x86_64 ]] || fail "native guest architecture must be x86_64"
++[[ $architecture == x86_64 || $architecture == aarch64 ]] || fail "unsupported native guest architecture: $architecture"
+ [[ $profile == factory ]] || fail "native guest profile must be factory"
+ 
+ mkdir -p "$root/etc" "$root/etc/skel" "$root/usr/share/try-omarchy"
+diff --git a/guest/scripts/finalize-rootfs.sh b/guest/scripts/finalize-rootfs.sh
+index 372a935..668c6a4 100755
+--- a/guest/scripts/finalize-rootfs.sh
++++ b/guest/scripts/finalize-rootfs.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ 
+-# Runs inside the x86_64 Arch root after packages and files are staged.
++# Runs inside the native Arch root after packages and files are staged.
+ set -euo pipefail
+ 
+ spec=/usr/share/try-omarchy/build-spec.json
+@@ -10,8 +10,9 @@ read_spec() {
+   python3 -c "import json; print(json.load(open('$spec'))$1)"
+ }
+ 
+-[[ $(read_spec '["image"]["architecture"]') == x86_64 ]] || {
+-  echo "Factory guest must be x86_64" >&2
++architecture=$(read_spec '["image"]["architecture"]')
++[[ $architecture == x86_64 || $architecture == aarch64 ]] || {
++  echo "Unsupported factory guest architecture: $architecture" >&2
+   exit 1
+ }
+ [[ $(read_spec '["guest"].get("profile")') == factory ]] || {
+@@ -37,7 +38,7 @@ ln -sfn /usr/lib/systemd/system/graphical.target /etc/systemd/system/default.tar
+ [[ -x /usr/bin/omarchy-provision-owner ]] || { echo "Missing upstream owner provisioner" >&2; exit 1; }
+ [[ -f /var/lib/omarchy/provisioning/pending ]] || { echo "Factory provisioning is not armed" >&2; exit 1; }
+ expected_mise=$(read_spec '["supplyChain"]["mise"]["reportedVersion"]')
+-[[ -x /usr/bin/mise ]] || { echo "Missing pinned x86_64 mise" >&2; exit 1; }
++[[ -x /usr/bin/mise ]] || { echo "Missing pinned mise" >&2; exit 1; }
+ [[ $(/usr/bin/mise --version) == "$expected_mise" ]] || { echo "Pinned mise identity mismatch" >&2; exit 1; }
+ systemctl enable omarchy-provision-owner.service
+ systemctl enable sddm.service
+diff --git a/guest/scripts/refresh-package-lock.sh b/guest/scripts/refresh-package-lock.sh
+index ca31b04..10c0f9e 100755
+--- a/guest/scripts/refresh-package-lock.sh
++++ b/guest/scripts/refresh-package-lock.sh
+@@ -48,7 +48,7 @@ spec=$(cd "$(dirname "$spec")" && pwd)/$(basename "$spec")
+ architecture=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["architecture"])' "$spec")
+ packages_input=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["packages"])' "$spec")
+ packages_file="$guest_dir/$packages_input"
+-[[ $architecture == "x86_64" ]] || fail "native guest architecture must be x86_64"
++[[ $architecture == x86_64 || $architecture == aarch64 ]] || fail "unsupported native guest architecture: $architecture"
+ [[ -f $packages_file ]] || fail "package list not found: $packages_file"
+ [[ -n $output ]] || fail "--output is required"
+ [[ $(uname -s) == "Linux" && $(uname -m) == "$architecture" ]] \
+diff --git a/guest/scripts/register-aquamarine.sh b/guest/scripts/register-aquamarine.sh
+index 231ad9c..927e970 100755
+--- a/guest/scripts/register-aquamarine.sh
++++ b/guest/scripts/register-aquamarine.sh
+@@ -23,6 +23,9 @@ mapfile -t metadata <<<"$metadata_text"
+ version=${metadata[0]} arch_version=${metadata[1]} package_version=${metadata[2]}
+ url=${metadata[3]} source_sha=${metadata[4]} patch_file=${metadata[5]}
+ soname=${metadata[6]} provide=${metadata[7]}
++architecture=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["architecture"])' "$spec")
++[[ $architecture == x86_64 || $architecture == aarch64 ]] || fail 'unsupported guest architecture'
++[[ $(uname -m) == "$architecture" ]] || fail 'builder architecture differs from guest'
+ epoch=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["sourceDateEpoch"])' "$spec")
+ [[ $epoch =~ ^[0-9]+$ ]] || fail 'invalid source date epoch'
+ for command in arch-chroot curl install pacman python3 readelf sha256sum tar zstd; do
+@@ -31,7 +34,7 @@ done
+ [[ $(arch-chroot "$root" pacman -Q aquamarine) == "aquamarine $arch_version" ]] || fail 'installed Arch version differs from pin'
+ # Reuse signed, transaction-verified Arch metadata, including versioned SONAME
+ # dependencies. Do not guess dependencies or provide a loose shared object.
+-original="$work/pacman-cache/aquamarine-$arch_version-x86_64.pkg.tar.zst"
++original="$work/pacman-cache/aquamarine-$arch_version-$architecture.pkg.tar.zst"
+ [[ -f $original && ! -L $original ]] || fail 'verified Arch package cache archive missing'
+ cache="$work/download-cache"
+ install -d -m0755 "$cache"
+@@ -83,7 +86,7 @@ size = sum(p.lstat().st_size for p in (stage / 'package/usr').rglob('*') if not
+ lines += [f'pkgver = {sys.argv[3]}', f'builddate = {sys.argv[4]}', 'packager = Try Omarchy reproducible guest builder', f'size = {size}']
+ (stage / 'package/.PKGINFO').write_text('\n'.join(lines) + '\n')
+ INFO
+-archive="$stage/aquamarine-$package_version-x86_64.pkg.tar.zst"
++archive="$stage/aquamarine-$package_version-$architecture.pkg.tar.zst"
+ tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --format=gnu \
+   -C "$stage/package" -cf - .PKGINFO usr | zstd --force --quiet -12 --threads=1 -o "$archive"
+ pacman --noconfirm --config "$pacman_config" --root "$root" --dbpath "$root/var/lib/pacman" \
+@@ -99,14 +102,16 @@ install -Dm0644 "$archive" "$root/usr/share/try-omarchy/repo/$(basename "$archiv
+ python3 - "$root" "$spec" "$archive" "$original" <<'PROVENANCE'
+ import hashlib, json, pathlib, sys
+ root, spec_path, archive, original = map(pathlib.Path, sys.argv[1:])
+-component = json.loads(spec_path.read_text())['supplyChain']['aquamarine']
++spec = json.loads(spec_path.read_text())
++component = spec['supplyChain']['aquamarine']
++locked_packages = json.loads((spec_path.parent / spec['inputs']['packageLock']).read_text())['packages']
+ path = root / 'usr/share/try-omarchy/provenance.json'
+ payload = json.loads(path.read_text())
+ payload['aquamarine'].update({
+     'installedLibrarySha256': hashlib.sha256((root / 'usr/lib' / component['soname']).read_bytes()).hexdigest(),
+     'packageSha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+     'archPackageSha256': hashlib.sha256(original.read_bytes()).hexdigest(),
+-    'buildPackageVersions': {name: json.loads((spec_path.parent / 'packages.lock.json').read_text())['packages'][name]
++    'buildPackageVersions': {name: locked_packages[name]
+                              for name in component['buildPackages']},
+ })
+ path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+diff --git a/guest/scripts/register-omarchy-runtime.sh b/guest/scripts/register-omarchy-runtime.sh
+index cbeb2c6..6d49735 100755
+--- a/guest/scripts/register-omarchy-runtime.sh
++++ b/guest/scripts/register-omarchy-runtime.sh
+@@ -173,7 +173,7 @@ if component:
+     # A minimum, never an equality or a custom provider, lets newer Arch
+     # aquamarine and its matching Hyprland upgrade in the same transaction.
+     version = component["packageVersion"]
+-    if not re.fullmatch(r"[0-9]+(?:[.][0-9]+)*-[0-9]+[.]1", version):
++    if not re.fullmatch(r"[0-9]+(?:[.][0-9]+)*-[0-9]+(?:[.][0-9]+)*[.]1", version):
+         raise SystemExit("unsafe aquamarine minimum version")
+     print(f"depend = aquamarine>={version}")
+ for name in spec["upstream"].get("integrationDepends", []):
+diff --git a/guest/scripts/register-pinned-mise.sh b/guest/scripts/register-pinned-mise.sh
+index 15985c4..8d8dcaa 100755
+--- a/guest/scripts/register-pinned-mise.sh
++++ b/guest/scripts/register-pinned-mise.sh
+@@ -6,7 +6,7 @@ usage() {
+   cat <<'USAGE'
+ Usage: register-pinned-mise.sh --root ROOT --work WORK --spec SPEC --pacman-config CONFIG
+ 
+-Downloads the spec-pinned official mise x86_64 archive, verifies the archive and
++Downloads the spec-pinned official mise archive, verifies the archive and
+ extracted binary digests, and installs its runtime files as a local Arch
+ package staged in the guest's immutable local repository.
+ USAGE
+@@ -92,19 +92,23 @@ license=${metadata[6]}
+ architecture=${metadata[7]}
+ source_date_epoch=${metadata[8]}
+ 
+-[[ $architecture == x86_64 ]] || fail "pinned mise component supports only x86_64"
++case "$architecture" in
++  x86_64) mise_arch=x64 ;;
++  aarch64) mise_arch=arm64 ;;
++  *) fail "unsupported pinned mise architecture: $architecture" ;;
++esac
+ [[ $version =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]] || fail "invalid mise version: $version"
+ [[ $sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid mise archive digest"
+ [[ $binary_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid mise binary digest"
+-[[ $reported_version == "$version linux-x64 ("*')' ]] || fail "invalid mise reported version"
++[[ $reported_version == "$version linux-$mise_arch ("*')' ]] || fail "invalid mise reported version"
+ [[ $license == MIT ]] || fail "unexpected mise license: $license"
+ [[ $source_date_epoch =~ ^[0-9]+$ ]] || fail "invalid source date epoch"
+-expected_url="https://github.com/jdx/mise/releases/download/v$version/mise-v$version-linux-x64.tar.xz"
++expected_url="https://github.com/jdx/mise/releases/download/v$version/mise-v$version-linux-$mise_arch.tar.xz"
+ [[ $url == "$expected_url" ]] || fail "mise URL does not match the pinned official release"
+ 
+ cache_dir="$work/download-cache"
+ install -d -m 0755 "$cache_dir"
+-asset_cache="$cache_dir/mise-v$version-linux-x64.tar.xz"
++asset_cache="$cache_dir/mise-v$version-linux-$mise_arch.tar.xz"
+ 
+ verify_file() {
+   local expected=$1
+@@ -169,12 +173,12 @@ cat >"$stage/.PKGINFO" <<EOF
+ pkgname = $package_name
+ pkgbase = $package_name
+ pkgver = $package_version
+-pkgdesc = Pinned official mise $version binary for the Omarchy x86_64 guest
++pkgdesc = Pinned official mise $version binary for the Omarchy $architecture guest
+ url = https://github.com/jdx/mise
+ builddate = $source_date_epoch
+ packager = Try Omarchy reproducible guest builder
+ size = $installed_size
+-arch = x86_64
++arch = $architecture
+ license = MIT
+ provides = mise=$version
+ conflict = mise
+@@ -182,7 +186,7 @@ depend = glibc
+ depend = gcc-libs
+ EOF
+ 
+-package_archive="$stage/$package_name-$package_version-x86_64.pkg.tar.zst"
++package_archive="$stage/$package_name-$package_version-$architecture.pkg.tar.zst"
+ tar \
+   --sort=name \
+   --mtime="@$source_date_epoch" \
+diff --git a/guest/spec-aarch64.json b/guest/spec-aarch64.json
+new file mode 100644
+index 0000000..b24c25e
+--- /dev/null
++++ b/guest/spec-aarch64.json
+@@ -0,0 +1,656 @@
++{
++  "schemaVersion": 1,
++  "image": {
++    "architecture": "aarch64",
++    "filesystem": "ext4",
++    "filesystemLabel": "omarchy-factory",
++    "filesystemUuid": "89054943-1f4e-4f14-b934-d6db3fba4254",
++    "sizeMiB": 8192,
++    "sourceDateEpoch": 1787652758
++  },
++  "guest": {
++    "profile": "factory",
++    "hostname": "omarchy-factory",
++    "username": null,
++    "uid": null,
++    "defaultTheme": null,
++    "virtualDisplay": {
++      "width": 1600,
++      "height": 900,
++      "refreshHz": 60,
++      "scale": 1
++    }
++  },
++  "upstream": {
++    "repository": "https://github.com/omacom/omarchy",
++    "commit": "c668141e9c42b13c80c9ca4ea108e11708c5e8a5",
++    "tree": "1d48adc1ba8636fd9362f7b9bf8819f3ac3258a4",
++    "treeSha256": "c7ae35645b64a205a3ac7af094b17ea0f406a710eb00185470a76f3ae8367952",
++    "version": "4.0.4",
++    "versionFile": "4.0.0.alpha",
++    "channel": "quattro",
++    "license": "MIT",
++    "packageRelease": 10,
++    "integrationDepends": [
++      "fcitx5",
++      "fcitx5-chewing",
++      "fcitx5-gtk",
++      "fcitx5-qt",
++      "gtk3",
++      "gtk4",
++      "gtk4-layer-shell",
++      "jq",
++      "libnotify",
++      "libpulse",
++      "man-db",
++      "noto-fonts-cjk",
++      "openssl",
++      "polkit",
++      "python",
++      "python-gobject",
++      "socat",
++      "wl-clipboard",
++      "xdg-user-dirs",
++      "zstd"
++    ]
++  },
++  "supplyChain": {
++    "omarchyPackagesRepository": "https://github.com/omacom-io/omarchy-pkgs",
++    "omarchyPackagesCommit": "7e448b90313fea4fb78da9a78607287691d3b241",
++    "mise": {
++      "version": "2026.8.11",
++      "url": "https://github.com/jdx/mise/releases/download/v2026.8.11/mise-v2026.8.11-linux-arm64.tar.xz",
++      "sha256": "fefd580d2c6a8169762f40ce5019a61de5b2dcf0b38c5d428ef6b97d5ce76fba",
++      "binarySha256": "6b7471271a990cbd6a795b24f9df83338aa220c227bf75fd083442e5a728f5f7",
++      "reportedVersion": "2026.8.11 linux-arm64 (2026-08-23)",
++      "license": "MIT"
++    },
++    "aquamarine": {
++      "version": "0.15.1",
++      "archVersion": "0.15.1-1.3",
++      "packageVersion": "0.15.1-1.3.1",
++      "url": "https://github.com/hyprwm/aquamarine/archive/v0.15.1/aquamarine-0.15.1.tar.gz",
++      "sha256": "2f9de98c0bd1b7b1b09c576e390a2fef436449762fb334163c414f0c300296f2",
++      "patch": "patches/aquamarine/cursor-hotspot.patch",
++      "patchSha256": "4b57ebb3ac10ed7a91348b49a7ee6fd26bcbd2436cb4dcdac60a6bc15bce0c27",
++      "soname": "libaquamarine.so.14",
++      "provide": "libaquamarine.so=14-64",
++      "buildPackages": [
++        "cmake",
++        "hyprwayland-scanner"
++      ],
++      "builderSha256": "186d5663fcc7ca6e563d8a536388b4dbf30e2c2a268fe8c9ae5fc803fac3329c"
++    }
++  },
++  "themes": [
++    "catppuccin",
++    "catppuccin-latte",
++    "ethereal",
++    "everforest",
++    "flexoki-light",
++    "gruvbox",
++    "hackerman",
++    "kanagawa",
++    "last-horizon",
++    "lumon",
++    "lupine",
++    "matte-black",
++    "miasma",
++    "nord",
++    "osaka-jade",
++    "retro-82",
++    "ristretto",
++    "rose-pine",
++    "solitude",
++    "tokyo-night",
++    "vantablack",
++    "white"
++  ],
++  "inputs": {
++    "packages": "packages-aarch64.txt",
++    "packageLock": "packages-aarch64.lock.json",
++    "pacmanConfig": "pacman-aarch64.conf"
++  },
++  "authenticity": {
++    "verbatimRuntimeTrees": [
++      "applications",
++      "config",
++      "default",
++      "migrations"
++    ],
++    "backportedRuntimeTrees": [
++      "shell",
++      "install",
++      "bin"
++    ],
++    "backports": [
++      {
++        "id": "notification-hover-close",
++        "description": "Restore the upstream hover-revealed notification dismiss control omitted from v4.0.2.",
++        "reference": "https://github.com/basecamp/omarchy/commit/9b72edcc94513cba016f145b1ac4ffdaea54b577",
++        "patch": "patches/omarchy/notification-hover-close.patch",
++        "patchSha256": "d6f5bb507bf7bee10df310bf5fe5218ec3bf9ca7e134896ee3b8527ca4a85312",
++        "targets": [
++          {
++            "path": "shell/plugins/notifications/components/NotificationCard.qml",
++            "beforeSha256": "3f023446cfe26b9f70570d7088baab31e56ca374c4a206a7c098b09d36cdff3d",
++            "afterSha256": "7522c2f6453a5db357c80132da53e8aa6d2881519ade10818dca0ca6355e7d51"
++          }
++        ]
++      },
++      {
++        "id": "notification-screen-privacy",
++        "description": "Hide and pause notification popups while the screensaver or private lock state obscures the session.",
++        "reference": "https://github.com/basecamp/omarchy/pull/8247",
++        "patch": "patches/omarchy/notification-screen-privacy.patch",
++        "patchSha256": "64cd3b8d4fbb4091b9c4984a8ce5279e22165d94659700c0ae9fc38cf8ad1090",
++        "targets": [
++          {
++            "path": "shell/plugins/notifications/Service.qml",
++            "beforeSha256": "11665542e70df80ccd3c785a6143dee2daefd2082e4f75c740adc2c9947cf7c2",
++            "afterSha256": "7b74608429e1cb538283b29c80d288ad6a0c5f1707fa8bd1df4567775bc10c8f"
++          },
++          {
++            "path": "shell/plugins/services/idle/Service.qml",
++            "beforeSha256": "50f5c81e2e94fab32395a5bc3cce982e30a10ab1b3f56cc58f29055951518a51",
++            "afterSha256": "02512cc96ecb82005b82e947ed891549d1721cbefad14fdb2eca9ab50e88c9eb"
++          },
++          {
++            "path": "shell/shell.qml",
++            "beforeSha256": "4a4b7694e5b9e0bd952ce0efa2d6dc2cea44cdfa98cc2f442e40fe41cbc1beab",
++            "afterSha256": "7a30685e7c82c0fc3366ee8f079d1d224f9e8eb4daf79df0aedaa0e30f541b89"
++          },
++          {
++            "path": "shell/services/AuthServiceStore.js",
++            "beforeSha256": "f47026ea2b8a0f23d5d4b3f0a9f47f60e94d7d81d2930b4486334c92575c8ccc",
++            "afterSha256": "92b16bfcf12de8a83043a6002acb637d2535ba6512d499c3ce856717e8af0792"
++          }
++        ]
++      },
++      {
++        "id": "setup-host-timezone",
++        "description": "Select the validated Windows time-zone hint in the first-boot personal setup form.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/e1a0dbe9820a8f7554ac3b930c2f13e1f41b25a1",
++        "patch": "patches/omarchy/setup-host-timezone.patch",
++        "patchSha256": "eb29717db81c9c55be4755b5e00648169ae53c8ecc4feac11da74628bef01efc",
++        "targets": [
++          {
++            "path": "install/provisioning/setup-form.sh",
++            "beforeSha256": "0fbb8c3c8b151e5ff884c16d381e12fda53cc16adfd08a684d41e7327250665d",
++            "afterSha256": "1c22eee021850489fb46b2ca4a50a7398fb9c15c1c70a7ecb36a18574ff46636"
++          }
++        ]
++      },
++      {
++        "id": "clock-timezone-refresh",
++        "description": "Refresh the QML date engine time-zone cache before refreshing the guest clock.",
++        "reference": "https://doc.qt.io/qt-6/qml-qtqml-date.html#timeZoneUpdated-method",
++        "patch": "patches/omarchy/clock-timezone-refresh.patch",
++        "patchSha256": "1f42c15449c3a308e0c66f55c264b79910055efb18f26df73829b348341a6a1d",
++        "targets": [
++          {
++            "path": "shell/plugins/panels/clock/BarWidget.qml",
++            "beforeSha256": "cfcdaeedc4ae5832b37271a84bb92ee762301022e2443a0f769992fa792acf28",
++            "afterSha256": "29cd6b0c67dd97f18f9f5f9ee7e402f13d79d4ddc5e78dc08a838a3e03565a51"
++          }
++        ]
++      },
++      {
++        "id": "screensaver-terminal-fit",
++        "description": "Fit screensaver branding to the terminal and track the launched effect.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/6bb13591f954df193430a5c0cc7eab650af5111d",
++        "patch": "patches/omarchy/screensaver-terminal-fit.patch",
++        "patchSha256": "c915013c163d97d794393ea7945357cbe6a1c98d55e93cd72dc248aa3f13498e",
++        "targets": [
++          {
++            "path": "bin/omarchy-screensaver",
++            "beforeSha256": "9ad1b57d322b5ed04112824ef48c98b7f14f1f08a60b583395558afbfd9fb7d2",
++            "afterSha256": "364921e409c890e500f832437fbd986464ca36dce8d811f8ad63b940855338d5"
++          }
++        ]
++      },
++      {
++        "id": "update-free-space-message",
++        "description": "Explain guest disk free space and Windows disk growth.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/a3a85e3e94f9cef5bf1b42c029434b0622e9ce9c",
++        "patch": "patches/omarchy/update-free-space-message.patch",
++        "patchSha256": "0f0089aa7e86d32af3e3917c7b2e4d367c576076e0e6ffe38b300b90899216bc",
++        "targets": [
++          {
++            "path": "bin/omarchy-update-requires-free-space",
++            "beforeSha256": "50a5ddef021dac5e79f789a53643fa91a6b8d7193b4d27786516d142525eca93",
++            "afterSha256": "c9b0349d3a13980b382a89d41bedb407ec0572121f04315fdbccdb7885eab7a0"
++          }
++        ]
++      },
++      {
++        "id": "first-run-update-notification",
++        "description": "Offer first-run package updates with normal urgency.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/e546fee9aa3ed15739c8fc5b7eaa1c5f235cee7b",
++        "patch": "patches/omarchy/first-run-update-notification.patch",
++        "patchSha256": "a2d980ec3c2720e2eabf84c22b18763a5b61ed2eb79b5a0a16d510ccf20f8444",
++        "targets": [
++          {
++            "path": "install/user/first-run/wifi.sh",
++            "beforeSha256": "4cc2621157be1efe6d449d1daa7b28d588e4a8e46127de493da03749af1ae5a7",
++            "afterSha256": "64ea34a6acaca232f2292e3786512b3398d8f33983c9a2e7582cf4a0d0ae04ad"
++          }
++        ]
++      },
++      {
++        "id": "windows-power-profile",
++        "description": "Show Windows-managed power policy instead of Linux profiles.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/78346907a266ea6532e1685165a5d060f8838858",
++        "patch": "patches/omarchy/windows-power-profile.patch",
++        "patchSha256": "5a3adf777acfdc3e6ad90476a486bc79c25362a52a32b76ced654eb63d451388",
++        "targets": [
++          {
++            "path": "bin/omarchy-powerprofiles-list",
++            "beforeSha256": "3d2e4b3d5ad974aa78c97a653d3fe937bd263063369a57f14918748502d1f609",
++            "afterSha256": "d27a9b6f2988719db911585f971d8963ad6da7f70210941a3f4734d8e90d921c"
++          },
++          {
++            "path": "bin/omarchy-powerprofiles-set",
++            "beforeSha256": "4595bb75e4000e2fc01bd3c7f1e578d07aecfa54e9dcd4e2d32d653c35bc66a9",
++            "afterSha256": "715bbefd4fdb3eff368dce4c8a3fd87b219976fa5de453e04afd48ea786488ce"
++          },
++          {
++            "path": "shell/plugins/menu/Menu.qml",
++            "beforeSha256": "0154d0ec3855fbb48aa06eaa724a19f3c07c377494d4a3de65daed2d7d9100e3",
++            "afterSha256": "6f266b3a7acd5ee97d5ea5446aa8c45306371586fc55f0ad4d93a6b2789dba3c"
++          },
++          {
++            "path": "shell/plugins/panels/power/Panel.qml",
++            "beforeSha256": "560e17a5144d3e2ea1e0ad36c2aec563909b535551e1e66e061f5fb25f1d4ec0",
++            "afterSha256": "c9b9519df8ecfae51f3073c15c1c1ef5481973d5ac8d941190e75fcb57246b65"
++          }
++        ]
++      },
++      {
++        "id": "virtio-nightlight",
++        "description": "Apply manual night light through a screen shader on the Windows virtio GPU, preserving custom shaders and serialized toggle intent. Adopt only the two unowned compatibility-delivered backend files during runtime upgrades, with failed-retry recovery.",
++        "reference": "https://github.com/omacom/try-omarchy/commit/54a222371eddb9d2c5286f0431302fd16bea9054",
++        "patch": "patches/omarchy/virtio-nightlight.patch",
++        "patchSha256": "38e20de5825cf6131bbf7762ec519a7f43326275b944c145c3f9d7d2d3d6ad92",
++        "targets": [
++          {
++            "path": "bin/omarchy-toggle-nightlight",
++            "beforeSha256": "da1a268c58df3633441a13c2f7d0e45a04c479bcc678d3fc545c2405848c4ac8",
++            "afterSha256": "70425df8d4336f27d3c28c6808e15c232e6855d7a8aa707f7874cc3d58f67c39"
++          },
++          {
++            "path": "shell/plugins/services/nightlight/Service.qml",
++            "beforeSha256": "721cd63d2404859918e28f92420e87369328c26fcef7df821443baa16d0b1897",
++            "afterSha256": "7b50c10f2975fb264707374a752ddc00040c8416891451e76846c211f39c852a"
++          },
++          {
++            "path": "bin/omarchy-update-system-pkgs-when-conflicted",
++            "beforeSha256": "dae1379216754e372f749ce4a4f3232b20225d08e2d0784d7607bba113ebbc62",
++            "afterSha256": "496a4d7e07a3af365d5f6669c348452fa6303c1db9950095bc2b259e66d2537a"
++          }
++        ]
++      },
++      {
++        "id": "qt612-palette",
++        "description": "Qualify the shell palette for Qt 6.12 without changing existing guest backports.",
++        "reference": "https://github.com/omacom/omarchy/pull/14553",
++        "patch": "patches/omarchy/qt612-palette.patch",
++        "patchSha256": "071d0171726c6e4d2a0df3463c5efdceba9209a945fc7b51ab499452c47798d9",
++        "targets": [
++          {
++            "path": "shell/Commons/Border.qml",
++            "beforeSha256": "b98c82530126fc10a287845e8df574ae26fa05b6064d93451d93d0ee9c3f7166",
++            "afterSha256": "4062986c0226eed4a7e054381ddf3f5bdbe20081a0c2f5efd7803a8606ea4b07"
++          },
++          {
++            "path": "shell/Commons/Style.qml",
++            "beforeSha256": "f5901092617ae62645597199270afd4dfb0644d596bdfff16e1834fca6ad7243",
++            "afterSha256": "68616995d44b4790e3b2653d0390140b569a6a3b2b9dde66d79b97911a12ea39"
++          },
++          {
++            "path": "shell/Ui/Button.qml",
++            "beforeSha256": "fda48672cc11dba109acea1cc98eb4b29746e5ce09f90a47f487b776ff99e799",
++            "afterSha256": "8237b16b740eb54c8ef3b1007dd30bf00b92bc1dc68e2b3644a06978a15c5158"
++          },
++          {
++            "path": "shell/Ui/ButtonGroup.qml",
++            "beforeSha256": "4af792f394534b7d61b270fcb44203bba8d88ed25f8822e0b90e456e35487542",
++            "afterSha256": "daecdccb8529c9d17e61b470571dac3fa41b2b0e6a888c5b7ca10205b17d4428"
++          },
++          {
++            "path": "shell/Ui/ConfirmDialog.qml",
++            "beforeSha256": "969cafe0580acb66d47947b7b6e9fa5103e1911b3a7dee03b84f2b154afc2762",
++            "afterSha256": "96ae48c0f4df28ff3b0ef9391ad8f24d3e252b416fa79a28b5bd801e71b1ac4f"
++          },
++          {
++            "path": "shell/Ui/CursorSurface.qml",
++            "beforeSha256": "27844a40fbe378e84c0aea35654dd8b396afb7e331c86be80852e1529da4f5b2",
++            "afterSha256": "4c3a8eb239d05b1e1d9261ba389c8ec0feb2811fae2a382c0f1d2c442e86d1c5"
++          },
++          {
++            "path": "shell/Ui/Dropdown.qml",
++            "beforeSha256": "6e2b847a33f5dedb96f65757d284f40b90073b3b34fd31abb84b2d471814fc5c",
++            "afterSha256": "67991822c07aaa8a64bacc2292eabea135ac3a4d1e47a8b798d8c46a04126890"
++          },
++          {
++            "path": "shell/Ui/KeyboardPanel.qml",
++            "beforeSha256": "96245f2da8d38baa0017caa285d596c485bd19a3a4d2cd1675bee9d84ffba42d",
++            "afterSha256": "c8b3b0fd52d8a79469675e925ff851e1dd0588eb1eeb90bd4df004a4c7d72a0a"
++          },
++          {
++            "path": "shell/Ui/MultiSelect.qml",
++            "beforeSha256": "ed85c2bf48ca17a059611b582d3d650eb2a1ad37cff2b700ca0c6c441a4c52df",
++            "afterSha256": "d21d5b480b8e8e55683b49f7f83effc317b8242cc63f6be702c36e3b8ffce8bd"
++          },
++          {
++            "path": "shell/Ui/NumberField.qml",
++            "beforeSha256": "b3584b513ee720f9f3e0f098d19ca1b129a02270c140528455d88fe04e2f2c8b",
++            "afterSha256": "ace8efa37fd1f423eb8046066b7ebd6d8b14cbbb113205353df820e73f9ef1f6"
++          },
++          {
++            "path": "shell/Ui/OpticalGlyph.qml",
++            "beforeSha256": "293e2863c7ff18998a7aea651fa952a564a860df125bf8900b7e739500b3c352",
++            "afterSha256": "1e1a3f545d409814b1673be6c20512ef1ca01a4d5ad653f77ff0433fefa0ec00"
++          },
++          {
++            "path": "shell/Ui/Panel.qml",
++            "beforeSha256": "e6588b3d7c1075d68c6392d028483fcc5d4d2bcb29180758fe265a957cbdc71d",
++            "afterSha256": "c5c9fff24d3fd294efc23aff8000c39542228d481837f79d2b5f82af7f1ed1ae"
++          },
++          {
++            "path": "shell/Ui/PanelActionButton.qml",
++            "beforeSha256": "6c94ff62997f18d1712a741e8ae24ed98a6fa5c6350b266c631ff92f26cffdc7",
++            "afterSha256": "89c440a0fc2d5a04b5640d9a2ad9eca32930f786e57bddb50fb13ad8a4aa084d"
++          },
++          {
++            "path": "shell/Ui/PanelHero.qml",
++            "beforeSha256": "bf0753e69c91c906b8f1e1a46cfbbd4326228e9d9abde1b4007ee86c0bf78f05",
++            "afterSha256": "ce9b264b071448d37a71dbda3a60627be18b679098ea7f5326ea59a65df2d3cf"
++          },
++          {
++            "path": "shell/Ui/PanelSectionHeader.qml",
++            "beforeSha256": "ede63ff97dd3d4d2198b771cbb33dcd07b7026d64d92f1c624e71465d000115d",
++            "afterSha256": "7747685a102cb8a5f8f239acb72ce43c7c3a0326eb884db71e8427ab9c62e597"
++          },
++          {
++            "path": "shell/Ui/PanelSeparator.qml",
++            "beforeSha256": "667cd49e89c5911fbe564904720b3d4073057e0b6fa38f03e55fa5949ccd195c",
++            "afterSha256": "54b970d6a6e5683583906517c808f271227f5b47a3a1ac3a58faa3f41d822316"
++          },
++          {
++            "path": "shell/Ui/PanelSlider.qml",
++            "beforeSha256": "aa8fcf167324ff9eb60a219f037004482adbe2a30369af123d53956a81a93068",
++            "afterSha256": "e1a56b744e89ccb9abee22557e062e23f6ba11b18b081508577165178bb49841"
++          },
++          {
++            "path": "shell/Ui/PanelToolTip.qml",
++            "beforeSha256": "5520685c2d160002cb4bd62c9e5da193003c071fca69b90e6012ebf0c8ee4ca3",
++            "afterSha256": "fa62fbdbe132bb90d9fca95b97b3ed7c5f0f7ca345fa9bac643ab15fce03f2ca"
++          },
++          {
++            "path": "shell/Ui/PopupCard.qml",
++            "beforeSha256": "b3751c78dba9d3b6383c072c915c3d1ecf5e2227cc8417127323077df1f0af5a",
++            "afterSha256": "e29abfcde9db314a9ebce3c7640ff6be996badc168ad5a862f63678dabfdd809"
++          },
++          {
++            "path": "shell/Ui/SearchableDropdown.qml",
++            "beforeSha256": "a30cff5297ba595235ead18c956b1268d140b3962375b5ed14d98f6ed0eecc10",
++            "afterSha256": "98e71d4fc3679d9a260db2ca29b6935db18447faecf190a8122ee31ef4a1384b"
++          },
++          {
++            "path": "shell/Ui/SpeedTestOverlay.qml",
++            "beforeSha256": "f7b37ccf6e641c3a607d91b824f7df15aac6177e5004462718842c686325af48",
++            "afterSha256": "536a939d5160b5802b74cd194023ef274c0146b54765581a55e505e74437dc2f"
++          },
++          {
++            "path": "shell/Ui/TextField.qml",
++            "beforeSha256": "b3ad72f56f86c2df164e347d64205c099f77c5fb90933fabea3b0f2a9e2b3778",
++            "afterSha256": "08c8141e74b7791060461939626f08453a28fe97eed4f4339dabde9d6a6edb3b"
++          },
++          {
++            "path": "shell/Ui/Toggle.qml",
++            "beforeSha256": "158aaa84cf1fff771b932bb1c79e00be19bee1bfeef2d27bfbd8aa4f1c416e6b",
++            "afterSha256": "a51d10bc49d283ba837ce84f511d8cd5ef26c47e261e9ccf9e67acc59b594b93"
++          },
++          {
++            "path": "shell/Ui/ToggleSwitch.qml",
++            "beforeSha256": "6bfae25396c1d03979efd9a27130e03f11edc2c7062d1f0c0c252b30e60a9898",
++            "afterSha256": "97ef05b8a752ededda041485f42a57bc578e0a58acd4a3696ac0d253c77c8741"
++          },
++          {
++            "path": "shell/Ui/WidgetButton.qml",
++            "beforeSha256": "a3cc74adca517b73a176eae0f93e976c24a3ec73b4b5855340b61b1ed2dcd08f",
++            "afterSha256": "576f2ade5c9e746131d63ae88f1bbc12cd71081764cecff43d3e36afcad354ac"
++          },
++          {
++            "path": "shell/plugins/agents/Panel.qml",
++            "beforeSha256": "0e5ecdb45eaff618963851c16a1f5066307c13195526890d2cbb6ddb5a1aa7c1",
++            "afterSha256": "805507f950480bee99c552a10086f90ca3005b8f605525248cf356da0fdc20c2"
++          },
++          {
++            "path": "shell/plugins/background/Background.qml",
++            "beforeSha256": "505c7d4af8323bdb201cd816aa8332248dcfd4c056ec8f64b5c0a2ae1776c58a",
++            "afterSha256": "6135a06b4c17c9a5a251053c294a657ecd80eb3a339f6eea146455b3925fd65b"
++          },
++          {
++            "path": "shell/plugins/bar/Bar.qml",
++            "beforeSha256": "9874c0f36271840b43002890ae333c83097df7f4cff0bade81536a41ed83590b",
++            "afterSha256": "94c85d1a776933053c54e56317662e520805e5d78ff24bc65d4305a18351ce5e"
++          },
++          {
++            "path": "shell/plugins/bar/widgets/ActiveWindow.qml",
++            "beforeSha256": "e53bbf968f78a9c4748c1872d6b34e1914070fc170641730bc2f7b4bce4e0173",
++            "afterSha256": "a1750665ab005efec042da80390c58f8b9337e8b7800bb80dad88e3e2d62877f"
++          },
++          {
++            "path": "shell/plugins/bar/widgets/Tray.qml",
++            "beforeSha256": "6566c548c76e56315589a126965eb686a6be812b1106d618045fee01a5095dd0",
++            "afterSha256": "dbdd6dddd739c74c00c7e68d1a5c738acddc4dafff92559dc26607463cfcc85d"
++          },
++          {
++            "path": "shell/plugins/clipboard/Clipboard.qml",
++            "beforeSha256": "7fcc8abf8ba142d81c79e265a662769e4c101826b4716ef8a976ee333cbbfa81",
++            "afterSha256": "a17f4a67a68ece6176b854cc548078e5b21b3964acd56f02136d95cc4e7caba3"
++          },
++          {
++            "path": "shell/plugins/dev-gallery/GalleryPanel.qml",
++            "beforeSha256": "4fa15562d85fd021a7cfe46474e0bdda4b063c3f4f56c6c61dbb5148b6f5aaa8",
++            "afterSha256": "ee7e0477865b8ca92d86847d9558d139379d1882d8ffc508a1051a92a07dbd1b"
++          },
++          {
++            "path": "shell/plugins/emojis/Emojis.qml",
++            "beforeSha256": "ff49e2e8174e0c0925d76c9b686f4de1e7297aa256c9dcc7320ed00c39dafeda",
++            "afterSha256": "8e7cf2e6ba1c156574a7034b7510aa8cae901776e58d68b8218cf5c8e659d661"
++          },
++          {
++            "path": "shell/plugins/image-picker/ImagePicker.qml",
++            "beforeSha256": "0bcb5e97a06f5dd14ce8265b16039f01cb5a1e99f64d01165e66786a1aa175e0",
++            "afterSha256": "9799f9cb52ffc4bd6d3089a50b73386b017e1c726b786e193e12d83561385ca8"
++          },
++          {
++            "path": "shell/plugins/lock/LockView.qml",
++            "beforeSha256": "9b174cf3ba8569dede528968be38994491ac73d9ca708f7e9451beeec7b4d066",
++            "afterSha256": "8cfb7acbe062086ae90939f1e9b925ed2beac18e903b5e7f9d14a638d7cf5807"
++          },
++          {
++            "path": "shell/plugins/lock/Service.qml",
++            "beforeSha256": "3f0a265a09f7957e8f5d74666595d3136ec64899c414426190460f9e2098e701",
++            "afterSha256": "79fe6348955047cd18183a4e2f5bbb020289a62d2f761ede13e71fb58d784f3b"
++          },
++          {
++            "path": "shell/plugins/menu/Menu.qml",
++            "beforeSha256": "6f266b3a7acd5ee97d5ea5446aa8c45306371586fc55f0ad4d93a6b2789dba3c",
++            "afterSha256": "13fd49a8f0c5163e079a23bd5b0c0b9826ad051747caa1e80deee1210c70a77c"
++          },
++          {
++            "path": "shell/plugins/notifications/components/NotificationCard.qml",
++            "beforeSha256": "7522c2f6453a5db357c80132da53e8aa6d2881519ade10818dca0ca6355e7d51",
++            "afterSha256": "d38a2fa8b4137f5b7735fb1b4a60eb5a4cde50ba5098044762f26c4b11bb3c50"
++          },
++          {
++            "path": "shell/plugins/osd/Osd.qml",
++            "beforeSha256": "a139b64d45f89a6b55ebcbd1233347f75b541b020e24b4286d6e00a6d5f5c50c",
++            "afterSha256": "f7abf7e92286671bdef821be169b6d6b456fb6df014524cf4d227d6f2a49a1a3"
++          },
++          {
++            "path": "shell/plugins/panels/audio/Panel.qml",
++            "beforeSha256": "831efaa29097d06abed31480a9e54208552e3f4e529a5c4ecca9255b12c5a7b1",
++            "afterSha256": "a683e771f495837170371da658e00cef1dacc89d0220d44d9e0e988ab2bbd2c0"
++          },
++          {
++            "path": "shell/plugins/panels/bluetooth/Panel.qml",
++            "beforeSha256": "f51654a00e3bfe5d6ccfd42bbd972d9436f70a27d152baa43ccdcbd8c66e1225",
++            "afterSha256": "018af5e96d27fe1f09dca2b2f24904c06290e31d21d00974387e0d51de8ae4b2"
++          },
++          {
++            "path": "shell/plugins/panels/clock/Panel.qml",
++            "beforeSha256": "396d98c9696a64977166be99d3b70c102ca20ac30f41e073fe1d168fde61de75",
++            "afterSha256": "1fc30583be12138f54d15300460b3db112165e1165842b53ea8f45d41bbb5286"
++          },
++          {
++            "path": "shell/plugins/panels/dropbox/DropboxIcon.qml",
++            "beforeSha256": "3367632df6a80998e377a085483deb61175bf572138db81bd8f71423d06ca349",
++            "afterSha256": "82e161b779678ef45d1a3a663435e905b13e4dc9a362e79acd3088afd6778a36"
++          },
++          {
++            "path": "shell/plugins/panels/dropbox/Panel.qml",
++            "beforeSha256": "4bc3b9660fd84e57c170004e0840495aa5d95c6cf1be0f891b9b58e6cc232d7a",
++            "afterSha256": "229747c5bf378adc722e4438a09872732c3ea3b55b47e926e48aa4ad4f361d23"
++          },
++          {
++            "path": "shell/plugins/panels/monitor/Panel.qml",
++            "beforeSha256": "2f3f95e5fc75af2af1f1af418a65469c37714b2bec38cfd2206bdd3f1f1b0e69",
++            "afterSha256": "c83de19eb30b50a369be85753aeddabc82506dfabae8109f39ef2d17c79db69e"
++          },
++          {
++            "path": "shell/plugins/panels/network/Panel.qml",
++            "beforeSha256": "84d81680cfd2e06b4f07d40129c7e40e6e173e9d4794471c003e14a8f1b1e693",
++            "afterSha256": "1e551a8d109535d2673ec9bb08faea01acdba27141c82aae6b7ae3be8da3c002"
++          },
++          {
++            "path": "shell/plugins/panels/power/Panel.qml",
++            "beforeSha256": "c9b9519df8ecfae51f3073c15c1c1ef5481973d5ac8d941190e75fcb57246b65",
++            "afterSha256": "a263776fcf032e2858eb5ab094cd68d7c7156c57705bb818415c51c12062a1f6"
++          },
++          {
++            "path": "shell/plugins/panels/tailscale/Panel.qml",
++            "beforeSha256": "c1f343ba875e49031fd4133bc4bba224980207f08a991b9882f3c3ac8c70f5df",
++            "afterSha256": "027c0777eecdcd4e9d4fb3614b14bc1fc54345eedd0d01a3a96b9eb5848d56b6"
++          },
++          {
++            "path": "shell/plugins/panels/tailscale/TailscaleIcon.qml",
++            "beforeSha256": "f3e35a849425b3400891726ca06a12681853a17599ccb66da2a788c0e0261beb",
++            "afterSha256": "05142bf1863a671c3b6b39f4a2455d556e2a75b4a373aa1a559c36c918aa8329"
++          },
++          {
++            "path": "shell/plugins/panels/weather/Panel.qml",
++            "beforeSha256": "47e38b979a578b662428844d11707d29db7f7933fdf60b69bc955429fdf5c201",
++            "afterSha256": "3a5b1345741f699e426ac08a2e4548a8bc0e0c4c82a54600402f716c20736de5"
++          },
++          {
++            "path": "shell/plugins/polkit/PolkitAgent.qml",
++            "beforeSha256": "dfd8e994bd774b9d6d5375f1380a51db1813ce2c060a37c3519c75f0c089dde6",
++            "afterSha256": "33b31505ec127294eb906944bd2a15a97453229e78e22f816b4363ccb7d3e74c"
++          },
++          {
++            "path": "shell/plugins/reminders/ReminderFlow.qml",
++            "beforeSha256": "1ffb380e1b3d85539aae8b9407d271bd9e42ae936d3d853b543afcfd714c3857",
++            "afterSha256": "d059a0788d9b258b12fdbc0774953790c797791ca314428bff2c1d157dc47b54"
++          },
++          {
++            "path": "shell/plugins/services/media/BarWidget.qml",
++            "beforeSha256": "05b9bca8673facb447d7b10b513865c80b5de7dc61828efc41026de4bb960d42",
++            "afterSha256": "ce61de66e6204a049ce6f35af8cbb8d8ef2f5211fd1bc690b2018cf45d75837e"
++          },
++          {
++            "path": "shell/shell.qml",
++            "beforeSha256": "7a30685e7c82c0fc3366ee8f079d1d224f9e8eb4daf79df0aedaa0e30f541b89",
++            "afterSha256": "b0bb7b418cced7331953615b4d6cec49fecaed65a573ce09da5cbe9f49eb41b1"
++          }
++        ]
++      }
++    ],
++    "requiredPaths": [
++      "LICENSE",
++      "bin/omarchy",
++      "bin/omarchy-launch-shell",
++      "bin/omarchy-menu",
++      "bin/omarchy-provision-owner",
++      "bin/omarchy-provision-user",
++      "bin/omarchy-theme-set",
++      "bin/omarchy-update-restart",
++      "config/foot/foot.ini",
++      "config/hypr/hyprland.lua",
++      "config/hypr/monitors.lua",
++      "config/omarchy/shell.json",
++      "default/hypr/omarchy.lua",
++      "default/omarchy/omarchy-menu.jsonc",
++      "default/themed/shell.toml.tpl",
++      "default/uwsm/env.d/10-omarchy",
++      "default/wayland-sessions/omarchy.desktop",
++      "install/provisioning/omarchy-provision-owner.service",
++      "install/provisioning/setup-form.sh",
++      "install/user/all.sh",
++      "shell/plugins/notifications/components/NotificationCard.qml",
++      "shell/plugins/notifications/Service.qml",
++      "shell/plugins/services/idle/Service.qml",
++      "shell/shell.qml",
++      "themes/tokyo-night/colors.toml",
++      "version"
++    ]
++  },
++  "runtime": {
++    "kernel": "vmlinuz-linux",
++    "kernelSource": "/boot/Image",
++    "initramfs": "initramfs-linux.img",
++    "initramfsSource": "/boot/initramfs-linux.img",
++    "disk": "rootfs.ext4",
++    "compressedDisk": "rootfs.ext4.zst",
++    "kernelCommandLine": "root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=4 systemd.show_status=false rd.systemd.show_status=false mitigations=off nowatchdog omarchy.qemu=1",
++    "minimumMemoryMiB": 2048,
++    "recommendedMemoryMiB": 4096,
++    "minimumCpuCount": 4,
++    "virtualMachineMonitor": "qemu-system-aarch64",
++    "hypervisor": "whpx",
++    "graphics": {
++      "device": "virtio-gpu-pci",
++      "display": "sdl",
++      "guestRenderer": "llvmpipe",
++      "hostRenderer": "none"
++    },
++    "network": {
++      "device": "virtio-net-pci",
++      "backend": "slirp",
++      "mode": "user"
++    },
++    "audio": {
++      "controller": "virtio-sound-pci",
++      "backend": "sdl",
++      "duplex": true
++    },
++    "storage": {
++      "device": "virtio-blk-pci",
++      "format": "raw",
++      "mode": "ephemeral",
++      "initialization": "full-copy",
++      "expandedSizeMiB": 24576
++    },
++    "devices": [
++      "virtio-blk-pci",
++      "virtio-gpu-pci",
++      "virtio-keyboard-pci",
++      "virtio-tablet-pci",
++      "virtio-net-pci",
++      "virtio-serial-pci",
++      "virtconsole",
++      "virtserialport",
++      "virtio-rng-pci",
++      "virtio-balloon-pci",
++      "virtio-sound-pci"
++    ],
++    "optionalDevices": [
++      "virtio-pinch-pci",
++      "dev.tryomarchy.timezone"
++    ]
++  }
++}
+diff --git a/guest/spec.json b/guest/spec.json
+index 5e6be7c..8a12abd 100644
+--- a/guest/spec.json
++++ b/guest/spec.json
+@@ -79,7 +79,7 @@
+         "cmake",
+         "hyprwayland-scanner"
+       ],
+-      "builderSha256": "6605eb6f71e9672be36d5c2352801d147b0ddc475f90d19d1fff352a1bb5600d"
++      "builderSha256": "186d5663fcc7ca6e563d8a536388b4dbf30e2c2a268fe8c9ae5fc803fac3329c"
+     }
+   },
+   "themes": [
+diff --git a/guest/tests/test_arm64_build_contract.py b/guest/tests/test_arm64_build_contract.py
+new file mode 100644
+index 0000000..78da9e2
+--- /dev/null
++++ b/guest/tests/test_arm64_build_contract.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""Contract tests for the architecture-specific guest inputs."""
++import hashlib
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++GUEST = Path(__file__).resolve().parents[1]
++
++
++class ArchitectureInputsTest(unittest.TestCase):
++    def test_reviewed_specs_match_their_transaction_and_aquamarine_contract(self):
++        for filename, architecture in (("spec.json", "x86_64"), ("spec-aarch64.json", "aarch64")):
++            with self.subTest(architecture=architecture):
++                spec_path = GUEST / filename
++                spec = json.loads(spec_path.read_text())
++                lock = json.loads((GUEST / spec["inputs"]["packageLock"]).read_text())
++                requested = (GUEST / spec["inputs"]["packages"]).read_bytes()
++                self.assertEqual(spec["image"]["architecture"], architecture)
++                self.assertEqual(lock["architecture"], architecture)
++                self.assertEqual(lock["requestedFileSha256"], hashlib.sha256(requested).hexdigest())
++                subprocess.run([sys.executable, str(GUEST / "scripts/aquamarine-contract.py"), str(spec_path)], check=True, capture_output=True, text=True)
++
++    def test_aquamarine_dependency_validation_uses_numeric_package_release(self):
++        script = (GUEST / "scripts/register-omarchy-runtime.sh").read_text()
++        marker = 'python3 - "$spec" >>"$stage/.PKGINFO" <<\'PY\'\n'
++        code = script.split(marker, 1)[1].split("\nPY\n", 1)[0]
++        with tempfile.TemporaryDirectory() as work:
++            spec_path = Path(work) / "spec.json"
++            for version, accepted in (("0.15.1-1.1", True), ("0.15.1-1.3.1", True), ("0.15.1-1.3", False), ("0.15.1-1.3.1\ndepend = injected", False), ("0.15.1-1.3.1;bad", False)):
++                with self.subTest(version=version):
++                    spec_path.write_text(json.dumps({"supplyChain": {"aquamarine": {"packageVersion": version}}, "upstream": {"integrationDepends": []}}))
++                    result = subprocess.run([sys.executable, "-", str(spec_path)], input=code, text=True, capture_output=True)
++                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
++                    if accepted:
++                        self.assertEqual(result.stdout, f"depend = aquamarine>={version}\n")
++
++    def test_mise_architecture_validation_fails_closed_before_download(self):
++        with tempfile.TemporaryDirectory() as work:
++            work = Path(work)
++            root = work / "root"
++            root.mkdir()
++            bin_dir = work / "bin"
++            bin_dir.mkdir()
++            for name in ("arch-chroot", "curl", "pacman", "zstd"):
++                stub = bin_dir / name
++                stub.write_text("#!/bin/sh\nexit 1\n")
++                stub.chmod(0o755)
++            cfg = work / "pacman.conf"
++            cfg.touch()
++            spec_path = work / "spec.json"
++            for architecture, suffix, should_reach_download in (("x86_64", "x64", True), ("aarch64", "arm64", True), ("aarch64", "x64", False), ("unknown", "arm64", False)):
++                with self.subTest(architecture=architecture, suffix=suffix):
++                    version = "2026.8.11"
++                    spec_path.write_text(json.dumps({"image": {"architecture": architecture, "sourceDateEpoch": 1}, "supplyChain": {"mise": {"version": version, "url": f"https://github.com/jdx/mise/releases/download/v{version}/mise-v{version}-linux-{suffix}.tar.xz", "sha256": "a" * 64, "binarySha256": "b" * 64, "reportedVersion": f"{version} linux-{suffix} (test)", "license": "MIT"}}}))
++                    env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
++                    result = subprocess.run(["bash", str(GUEST / "scripts/register-pinned-mise.sh"), "--root", str(root), "--work", str(work), "--spec", str(spec_path), "--pacman-config", str(cfg)], env=env, text=True, capture_output=True)
++                    self.assertNotEqual(result.returncode, 0)
++                    self.assertEqual("download failed" in result.stderr, should_reach_download, result.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/guest/tests/test_build_container_arch.py b/guest/tests/test_build_container_arch.py
+new file mode 100644
+index 0000000..1d94f46
+--- /dev/null
++++ b/guest/tests/test_build_container_arch.py
+@@ -0,0 +1,146 @@
++"""Architecture selection never shares the default ARM and x86 build outputs."""
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++
++GUEST = Path(__file__).resolve().parents[1]
++
++
++class BuildContainerArchitectureTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.guest = self.root / "guest"
++        self.guest.mkdir()
++        shutil.copy2(GUEST / "build-container.sh", self.guest / "build-container.sh")
++        self.script = self.guest / "build-container.sh"
++        self.spec("spec.json", "x86_64")
++        self.spec("spec-aarch64.json", "aarch64")
++        self.bin = self.root / "bin"
++        self.bin.mkdir()
++        self.docker_log = self.root / "docker.log"
++        docker = self.bin / "docker"
++        docker.write_text('#!/bin/sh\nprintf \'[%s]\\n\' "$@" >>"$DOCKER_LOG"\nif [ "$1" = image ]; then echo sha256:fixture; fi\n')
++        docker.chmod(0o755)
++        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"], DOCKER_LOG=str(self.docker_log))
++
++    def spec(self, name, architecture, profile="factory"):
++        path = self.guest / name
++        path.write_text(json.dumps({"image": {"architecture": architecture}, "guest": {"profile": profile}}))
++        return path
++
++    def run_build(self, *args):
++        return subprocess.run([str(self.script), *map(str, args)], cwd=self.root, env=self.env, capture_output=True, text=True)
++
++    def test_defaults_preserve_amd64_and_separate_arm_artifacts(self):
++        x86 = self.run_build("--dry-run")
++        self.assertEqual(x86.returncode, 0, x86.stderr)
++        self.assertIn("architecture=x86_64\nplatform=linux/amd64\n", x86.stdout)
++        self.assertIn("output=" + str(self.root / "dist/guest") + "\n", x86.stdout)
++        arm = self.run_build("--spec", self.guest / "spec-aarch64.json", "--dry-run")
++        self.assertEqual(arm.returncode, 0, arm.stderr)
++        self.assertIn("architecture=aarch64\nplatform=linux/arm64\n", arm.stdout)
++        self.assertIn("output=" + str(self.root / "dist/guest-aarch64") + "\n", arm.stdout)
++        self.assertIn("-aarch64\n", arm.stdout)
++
++    def test_arm_run_passes_native_platform_and_spec_to_docker(self):
++        run = self.run_build("--spec", self.guest / "spec-aarch64.json", "--output", self.root / "out")
++        self.assertEqual(run.returncode, 0, run.stderr)
++        calls = self.docker_log.read_text()
++        self.assertIn("[linux/arm64]", calls)
++        self.assertIn("[try-omarchy-guest-builder-aarch64]", calls)
++        self.assertIn("[" + str(self.guest / "Containerfile-aarch64") + "]", calls)
++        self.assertIn("[/workspace/guest/spec-aarch64.json]", calls)
++        self.assertNotIn("[linux/amd64]", calls)
++
++    def test_arm_refuses_existing_output_before_docker(self):
++        for kind in ("visible", "hidden", "file", "symlink"):
++            with self.subTest(kind=kind):
++                output = self.root / kind
++                if kind in ("visible", "hidden"):
++                    output.mkdir()
++                    (output / ("asset" if kind == "visible" else ".asset")).write_text("keep")
++                elif kind == "file":
++                    output.write_text("keep")
++                else:
++                    output.symlink_to(self.root / "missing")
++                result = self.run_build("--spec", self.guest / "spec-aarch64.json", "--output", output)
++                self.assertNotEqual(result.returncode, 0)
++                self.assertIn("new or empty", result.stderr)
++                self.assertFalse(self.docker_log.exists())
++
++    def test_amd64_refuses_arm_metadata_before_docker(self):
++        for filename, section in (("build-spec.json", "image"), ("guest-manifest.json", "guest")):
++            with self.subTest(filename=filename):
++                output = self.root / filename
++                output.mkdir()
++                (output / filename).write_text(json.dumps({section: {"architecture": "aarch64"}}))
++                result = self.run_build("--output", output)
++                self.assertNotEqual(result.returncode, 0)
++                self.assertIn("refusing to overwrite", result.stderr)
++                self.assertFalse(self.docker_log.exists())
++
++    def test_amd64_allows_own_metadata_and_rejects_invalid_metadata(self):
++        output = self.root / "rerun"
++        output.mkdir()
++        metadata = output / "build-spec.json"
++        metadata.write_text(json.dumps({"image": {"architecture": "x86_64"}}))
++        self.assertEqual(self.run_build("--output", output).returncode, 0)
++        self.docker_log.unlink()
++        metadata.write_text("invalid")
++        result = self.run_build("--output", output)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("cannot identify", result.stderr)
++        self.assertFalse(self.docker_log.exists())
++
++    def test_amd64_refuses_unidentified_partial_guest_before_work(self):
++        for filename in ("rootfs.ext4", "rootfs.ext4.zst", "vmlinuz-linux", "initramfs-linux.img", "SHA256SUMS"):
++            with self.subTest(filename=filename):
++                output = self.root / filename
++                output.mkdir()
++                (output / filename).write_text("partial")
++                result = self.run_build("--output", output)
++                self.assertNotEqual(result.returncode, 0)
++                self.assertIn("cannot identify existing guest", result.stderr)
++                self.assertFalse(self.docker_log.exists())
++
++    def test_arm_lock_refresh_uses_selected_spec(self):
++        target = self.root / "lock.json"
++        run = self.run_build("--spec", self.guest / "spec-aarch64.json", "--refresh-package-lock", target)
++        self.assertEqual(run.returncode, 0, run.stderr)
++        calls = self.docker_log.read_text()
++        self.assertIn("[linux/arm64]", calls)
++        self.assertIn("[/workspace/guest/scripts/refresh-package-lock.sh]", calls)
++        self.assertIn("[/workspace/guest/spec-aarch64.json]", calls)
++        self.assertIn("[/lock-output/lock.json]", calls)
++
++    def test_rejects_unknown_architecture_nonfactory_and_external_spec(self):
++        for path in (self.spec("bad.json", "arm64"), self.spec("profile.json", "aarch64", "personal")):
++            run = self.run_build("--spec", path, "--dry-run")
++            self.assertNotEqual(run.returncode, 0)
++        outside = self.root / "outside.json"
++        outside.write_text((self.guest / "spec-aarch64.json").read_text())
++        run = self.run_build("--spec", outside, "--dry-run")
++        self.assertNotEqual(run.returncode, 0)
++        link = self.guest / "alias.json"
++        link.symlink_to(outside)
++        self.assertNotEqual(self.run_build("--spec", link, "--dry-run").returncode, 0)
++
++    def test_amd64_run_keeps_existing_platform_and_spec(self):
++        run = self.run_build("--output", self.root / "out")
++        self.assertEqual(run.returncode, 0, run.stderr)
++        calls = self.docker_log.read_text()
++        self.assertIn("[linux/amd64]", calls)
++        self.assertIn("[try-omarchy-guest-builder]", calls)
++        self.assertIn("[/workspace/guest/spec.json]", calls)
++        self.assertNotIn("[linux/arm64]", calls)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/guest/vendor/omarchy-pkgs/LICENSE b/guest/vendor/omarchy-pkgs/LICENSE
+new file mode 100644
+index 0000000..f12cfa7
+--- /dev/null
++++ b/guest/vendor/omarchy-pkgs/LICENSE
+@@ -0,0 +1,20 @@
++Copyright (c) David Heinemeier Hansson
++
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to
++permit persons to whom the Software is furnished to do so, subject to
++the following conditions:
++
++The above copyright notice and this permission notice shall be
++included in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+diff --git a/guest/vendor/omarchy-pkgs/README.md b/guest/vendor/omarchy-pkgs/README.md
+new file mode 100644
+index 0000000..cab4b60
+--- /dev/null
++++ b/guest/vendor/omarchy-pkgs/README.md
+@@ -0,0 +1,6 @@
++# Vendored bootstrap helper
++
++`pacstrap-docker` is copied unchanged from `build/pacstrap-docker` at
++[omacom/omarchy-pkgs commit 7e448b90313fea4fb78da9a78607287691d3b241](https://github.com/omacom/omarchy-pkgs/blob/7e448b90313fea4fb78da9a78607287691d3b241/build/pacstrap-docker).
++Its SHA-256 is `dc31490fa0c387a68ee860d18cca67b43831a45206f2d5e9cfaff103fba85055`.
++The upstream MIT license is included in this directory.
+diff --git a/guest/vendor/omarchy-pkgs/pacstrap-docker b/guest/vendor/omarchy-pkgs/pacstrap-docker
+new file mode 100755
+index 0000000..0e3051f
+--- /dev/null
++++ b/guest/vendor/omarchy-pkgs/pacstrap-docker
+@@ -0,0 +1,23 @@
++#!/bin/bash
++# Simplified pacstrap for Docker (doesn't require mounts)
++
++set -e
++
++newroot=$1
++shift
++pacman_args=("${@:-base}")
++
++[[ -d "$newroot" ]] || { echo "ERROR: $newroot is not a directory"; exit 1; }
++
++echo "==> Creating install root at $newroot"
++mkdir -m 0755 -p "$newroot"/var/{cache/pacman/pkg,lib/pacman,log} "$newroot"/{dev,run,etc}
++mkdir -m 1777 -p "$newroot"/tmp
++mkdir -m 0555 -p "$newroot"/{sys,proc}
++
++echo "==> Installing packages to $newroot"
++if ! pacman -r "$newroot" -Sy --noconfirm "${pacman_args[@]}"; then
++    echo "ERROR: Failed to install packages"
++    exit 1
++fi
++
++echo "==> Installation complete"
+-- 
+2.53.0
+

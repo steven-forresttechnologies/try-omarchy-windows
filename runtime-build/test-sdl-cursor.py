@@ -204,6 +204,7 @@ int main(void) {
  sdl_mouse_define(&consoles[0].dcl,&sprite);assert(visible);
  sdl_cleanup();assert(!sprite.refs && !other.refs && frees>0);
  puts("ok - diagnostic override and cursor resource lifetime through recreation and cleanup");
+ (void)shutdown_action;
  return 0;
 }
 '''

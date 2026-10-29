@@ -6,9 +6,15 @@ repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 output=""
 contract_only=0
 source_only=0
+architecture=x86_64
 
 while (($#)); do
   case "$1" in
+    --architecture)
+      [[ $# -ge 2 && -n ${2:-} ]] || { echo "--architecture requires a value" >&2; exit 2; }
+      architecture=$2
+      shift 2
+      ;;
     --output)
       output=${2:-}
       shift 2
@@ -28,9 +34,58 @@ while (($#)); do
   esac
 done
 
+case "$architecture" in
+  x86_64|amd64) architecture=x86_64 ;;
+  aarch64) ;;
+  *) echo "Unsupported guest architecture: $architecture" >&2; exit 2 ;;
+esac
+
 if ((contract_only == 0)) && [[ -z $output ]]; then
-  echo "Usage: $0 --output DIR [--contract-only | --source-only]" >&2
+  echo "Usage: $0 --output DIR [--architecture x86_64|aarch64] [--contract-only | --source-only]" >&2
   exit 2
+fi
+
+# ARM artifacts currently share x86 filenames. Do not overwrite any existing
+# contents; a fresh directory also keeps candidate release evidence separate.
+if [[ $architecture == aarch64 ]] && ((contract_only == 0 && source_only == 0)); then
+  [[ ! -L $output && ( ! -e $output || -d $output ) ]] || { echo "ARM output must be a new or empty directory" >&2; exit 2; }
+  if [[ -d $output ]]; then
+    existing=$(find "$output" -mindepth 1 -maxdepth 1 -print -quit) || { echo "Cannot inspect ARM output directory" >&2; exit 2; }
+    [[ -z $existing ]] || { echo "ARM output must be a new or empty directory" >&2; exit 2; }
+  fi
+fi
+
+# An AMD64 rerun may reuse its output, but never an ARM candidate's files.
+if [[ $architecture == x86_64 && -d $output ]] && ((contract_only == 0 && source_only == 0)); then
+  if ! python3 - "$output" <<'PYGUARD'
+import json
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+identified = False
+for filename, section in (("build-spec.json", "image"), ("guest-manifest.json", "guest")):
+    path = output / filename
+    if path.is_symlink():
+        raise SystemExit(f"refusing symlinked guest metadata: {path}")
+    if not path.exists():
+        continue
+    try:
+        architecture = json.loads(path.read_text())[section]["architecture"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise SystemExit(f"cannot identify guest architecture in {path}")
+    if architecture != "x86_64":
+        raise SystemExit(f"refusing to overwrite {architecture} guest artifacts in {output}")
+    identified = True
+if not identified:
+    for filename in ("rootfs.ext4", "rootfs.ext4.zst", "vmlinuz-linux", "initramfs-linux.img", "SHA256SUMS"):
+        path = output / filename
+        if path.exists() or path.is_symlink():
+            raise SystemExit(f"cannot identify existing guest artifacts in {output}")
+PYGUARD
+  then
+    exit 2
+  fi
 fi
 
 source_lock="$repo_root/guest-build/source.lock.json"
@@ -86,7 +141,11 @@ if ((contract_only)); then
 fi
 
 mkdir -p "$output"
-sudo bash "$work/guest/build-container.sh" --output "$output"
+if [[ $architecture == aarch64 ]]; then
+  sudo bash "$work/guest/build-container.sh" --spec "$work/guest/spec-aarch64.json" --output "$output"
+else
+  sudo bash "$work/guest/build-container.sh" --output "$output"
+fi
 # The container build runs as root so it can create and mount the factory
 # filesystem. Return the finished release artifacts to the workflow user before
 # later steps extend SHA256SUMS and upload the files.

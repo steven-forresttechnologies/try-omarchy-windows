@@ -10,6 +10,25 @@ scripts/release/build-guest.sh --contract-only
 scripts/release/build-guest.sh --output /path/to/artifacts
 ```
 
+## Experimental ARM64 guest
+
+The ARM64 builder is a development path, not a supported release. On a Linux
+host with an ARM64-capable privileged Docker engine, build it explicitly with:
+
+```bash
+scripts/release/build-guest.sh --architecture aarch64 --output /path/to/arm64-artifacts
+```
+
+It uses a separate ARM64 package transaction and pinned factory spec. Package
+signatures remain required; if the live repositories have moved from the
+reviewed lock, the build stops for an intentional lock refresh. The ARM64
+launcher, graphics, update and release paths still require validation. Do not
+replace the published AMD64 guest or its release pin with these artifacts.
+
+The [ARM64 WHPX boot record](../docs/evidence/WINDOWS-ARM64-WHPX-BOOT-2026-10-28.md)
+describes the earlier resumed engineering build and its headless readiness test;
+it does not establish graphical desktop or feature parity.
+
 Patch 0147 opens links clicked in Windows inside Omarchy, only for URL schemes
 the user approved in Try Omarchy Settings. Agent version 6 starts every
 connection with links disabled. Each `url-approved` snapshot from the launcher

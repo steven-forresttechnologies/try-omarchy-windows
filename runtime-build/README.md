@@ -1,5 +1,60 @@
 # Source-built WINQ-EMU runtime
 
+## Experimental Windows ARM64 candidate
+
+On native Windows ARM64, use an MSYS2 CLANGARM64 shell and install the
+CLANGARM64 equivalents of the build dependencies, including Clang,
+`gcc-compat`, LLVM tools, Meson, Ninja, SDL2, GLib, libepoxy, libslirp, libusb,
+pixman, pkgconf, Python with PyYAML and Mako, Vulkan headers and loader, and zstd,
+alongside MSYS bison, diffutils, flex and Git. Then run:
+
+```sh
+bash runtime-build/build-arm64.sh runtime-output-arm64
+```
+
+This produces separately named `*-arm64.zip` runtime and source archives,
+checks their ARM64 PE machine types, and records package versions. The source
+and patches are locked, but package versions are recorded rather than pinned,
+so the recipe does not yet promise bit-for-bit reproducibility. QEMU's
+separate guest agent is disabled; Try Omarchy uses its own guest integration.
+Clang's warnings-as-errors are disabled for this engineering candidate until
+the upstream warnings are resolved. The existing AMD64 runtime and release pin
+are unchanged. ARM64 desktop graphics, integration and release acceptance are
+not established by a build or headless boot.
+The ARM collector follows static PE imports and rejects delay-load imports. It
+also includes the native Vulkan loader, which the renderer loads dynamically.
+Other libraries loaded with `LoadLibrary` are not discoverable from the import
+table; verify those paths and a clean extracted archive on real hardware.
+
+The ARM recipe also builds a private Dozen Vulkan ICD from
+`mesa-arm64.lock.json`. Mesa's official release archive, its host-import fixes,
+and DirectX-Headers are pinned independently. Meson cannot download additional
+fallbacks and is forced to use the pinned DirectX-Headers checkout. The driver,
+SPIR-V translator, relative ICD JSON, build options, source and licenses travel
+with the ARM artifacts. The AMD64 build does not build or select this driver.
+The ICD remains experimental; its inclusion is not a conformance claim.
+
+The private ICD also needs a DXIL validator. The ARM recipe extracts Microsoft's
+unmodified ARM64 binary and all three license notices from the official DXC
+release pinned in `dxc-arm64.lock.json`. Its archive digest, individual file
+hashes and release source commit are recorded separately from the source-built
+Mesa components. The collector checks its PE imports too. This binary has
+separate Microsoft terms; review the public distribution approach before an
+ARM release. No system driver or ICD registration is modified.
+
+On the tested Adreno X2 driver, Dozen needs the host-import memory-type and
+buffer-binding corrections in `patches/mesa/0001-*`. Renderer `0008-*` keeps
+plain, host-import and opaque exported resources distinct. Shared-memory WSI
+with `WINQ_DMABUF_SHIM_OFF=1` produced a visible 6000-frame Venus cube workload;
+the direct Vulkan-to-OpenGL import path produced a black desktop. Keep the
+private ICD and this presentation fallback together until further native
+acceptance establishes another combination. Do not register this ICD globally.
+
+Renderer `0007-*` fixes a separate VM-wide freeze: a rejected Windows proxy
+resource reply must include its zero descriptor count. The source fixtures
+`test-proxy-resource-reply.py` and `test-resource-shim.py` exercise the actual
+reply and resource-shim functions, including legacy exported-resource behavior.
+
 This recipe builds Try Omarchy's Windows QEMU runtime from the exact QEMU and
 virglrenderer fork commits in `sources.lock.json`. It produces:
 

@@ -1,0 +1,24 @@
+diff --git a/accel/whpx/whpx-common.c b/accel/whpx/whpx-common.c
+index 129c45b254..7ba97fc958 100644
+--- a/accel/whpx/whpx-common.c
++++ b/accel/whpx/whpx-common.c
+@@ -24,7 +24,9 @@
+ #include "qapi/qapi-types-common.h"
+ #include "qapi/qapi-visit-common.h"
+ #include "migration/blocker.h"
++#ifdef TARGET_I386
+ #include "host-cpu.h"
++#endif
+ #include "accel/accel-cpu-target.h"
+ #include <windows.h>
+ #include <winerror.h>
+@@ -611,7 +613,9 @@ static void whpx_cpu_accel_class_init(ObjectClass *oc, const void *data)
+ {
+     AccelCPUClass *acc = ACCEL_CPU_CLASS(oc);
+ 
++#ifdef TARGET_I386
+     acc->cpu_target_realize = host_cpu_realizefn;
++#endif
+     acc->cpu_instance_init = whpx_cpu_instance_init;
+ }
+ 

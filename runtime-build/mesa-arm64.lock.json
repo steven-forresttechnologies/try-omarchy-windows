@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "version": "26.2.5",
+  "url": "https://archive.mesa3d.org/mesa-26.2.5.tar.xz",
+  "sha256": "794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5",
+  "license": "MIT and other licenses documented in docs/license.rst",
+  "directxHeaders": {
+    "repository": "https://github.com/microsoft/DirectX-Headers.git",
+    "commit": "9e393d6d8a3b30dcc6f2806ef604ec16a27b0d7e",
+    "license": "MIT"
+  },
+  "patches": [
+    {
+      "file": "patches/mesa/0001-fix-host-import-resource-requirements-and-binding.patch",
+      "sha256": "d807ab5c7eda75cdd1f126fdb08e0dc3d38d9c769e520fad97719b6f82ed7dc4"
+    }
+  ]
+}

@@ -37,6 +37,26 @@ func qemuStartupFailureTail(vmDir string) string {
 // with the fastest flags upstream WHPX survives (any XSAVE/AVX feature panics
 // the guest kernel) and the mandatory -vga none for virtio-gpu-pci.
 func buildQemuArgs(cfg *config, cmdline string) []string {
+	// The supported launcher remains x86-only until the ARM runtime, guest and
+	// disk identity are selected and verified together.
+	args, _ := buildQemuArgsForArch(cfg, cmdline, "x86_64")
+	return args
+}
+
+// buildQemuArgsForArch keeps ARM topology separate from the supported x86
+// release path. GPU use requires the isolated development route's private ICD.
+func buildQemuArgsForArch(cfg *config, cmdline, architecture string) ([]string, error) {
+	if architecture != "x86_64" && architecture != "aarch64" {
+		return nil, fmt.Errorf("unsupported guest architecture %q", architecture)
+	}
+	if architecture == "aarch64" {
+		if cfg.irqchipOff || ((cfg.useGpu || cfg.venus) && !cfg.arm64GPU) {
+			return nil, fmt.Errorf("ARM graphics require the verified development runtime; irqchip recovery is unsupported")
+		}
+		if guestDisplayCount(cfg.displays) != 1 {
+			return nil, fmt.Errorf("ARM multiple displays are not validated")
+		}
+	}
 	vm := cfg.vmDir
 	args := []string{}
 	if pinchEnabled(cfg) {
@@ -46,18 +66,37 @@ func buildQemuArgs(cfg *config, cmdline string) []string {
 	// hostmem for GPU blob resources scales with it.
 	mem := fmt.Sprintf("%dM", cfg.memMiB)
 	hostmem := gpuHostMem(cfg.memMiB, cfg.hostTotalMiB)
+	if architecture == "aarch64" {
+		// Larger PCI blob BARs failed assignment on the acceptance machine.
+		// Keep the validated aperture until high-memory PCI has been tested.
+		hostmem = 256 << 20
+	}
+	display := displayDevice(cfg, hostmem)
+	if architecture == "aarch64" && cfg.useGpu {
+		display = strings.Replace(display, "virtio-vga-gl", "virtio-gpu-gl-pci", 1)
+	}
 	smp := fmt.Sprint(cfg.cpus)
 	if cfg.cpus <= 0 {
 		smp = fmt.Sprint(minimumAutoGuestCPUs)
 	}
+	sound := "virtio-sound-pci,audiodev=snd"
+	if architecture == "aarch64" && cfg.desktop.MicrophoneDisabled {
+		// virtio-snd otherwise creates a capture stream even when the audio
+		// backend has in.voices=0, then aborts while setting its volume.
+		// One stream advertises playback only and never opens host capture.
+		sound += ",streams=1"
+	}
 	machine := "q35,accel=whpx"
+	if architecture == "aarch64" {
+		machine = "virt,accel=whpx"
+	}
 	if cfg.irqchipOff {
 		machine += ",kernel-irqchip=off"
 	}
 	if cfg.useGpu {
 		args = append(args,
 			"-machine", machine, "-cpu", "host", "-smp", smp, "-m", mem,
-			"-device", displayDevice(cfg, hostmem),
+			"-device", display,
 			// The guest cursor is visible in the QEMU profile. Forcing SDL's host
 			// cursor as well produces two pointers that separate during motion.
 			// Keep only the guest cursor unless the diagnostic fallback is set.
@@ -68,10 +107,19 @@ func buildQemuArgs(cfg *config, cmdline string) []string {
 			"-serial", "file:"+filepath.Join(vm, "serial-gpu.log"),
 		)
 	} else {
+		cpu := "qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+aes"
+		if architecture == "aarch64" {
+			cpu = "host"
+		}
 		args = append(args,
-			"-machine", machine, "-cpu", "qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+aes",
+			"-machine", machine, "-cpu", cpu,
 			"-smp", smp, "-m", mem,
-			"-vga", "none", "-device", displayDevice(cfg, hostmem),
+		)
+		if architecture == "x86_64" {
+			args = append(args, "-vga", "none")
+		}
+		args = append(args,
+			"-device", display,
 			"-display", sdlDisplay(false, cfg.hostCursor),
 			"-serial", "file:"+filepath.Join(vm, "serial.log"),
 		)
@@ -114,17 +162,21 @@ func buildQemuArgs(cfg *config, cmdline string) []string {
 		// The q35 root bus cannot hotplug a PCIe controller. USB devices
 		// attach to this controller after the guest has started.
 		"-device", "qemu-xhci,id="+usbControllerID,
+	)
+	if architecture == "x86_64" {
 		// The guest must not sleep: a suspended VM leaves the window frozen
 		// with no way back from the keyboard, and Omarchy's power menu
 		// offers suspend whenever the kernel advertises it. With S3 and S4
 		// off the kernel reports no such state and systemd refuses cleanly.
-		"-global", "ICH9-LPC.disable_s3=1", "-global", "ICH9-LPC.disable_s4=1",
+		args = append(args, "-global", "ICH9-LPC.disable_s3=1", "-global", "ICH9-LPC.disable_s4=1")
+	}
+	args = append(args,
 		// The backend must be explicit: with no audiodev the guest's PipeWire
 		// stalls on virtio-snd control messages and the whole session hangs.
 		// cfg.audio is sdl normally, with dsound and none fallbacks when
 		// the host cannot initialize audio.
 		"-audiodev", audioBackendOptions(cfg.audio, cfg.desktop.MicrophoneDisabled, cfg.audioRates),
-		"-device", "virtio-sound-pci,audiodev=snd",
+		"-device", sound,
 		"-D", filepath.Join(vm, "qemu.log"),
 		// In-guest reboot/poweroff wedges upstream WHPX (vCPUs never return
 		// from system reset). Exit instead; the supervisor relaunches on reset.
@@ -161,7 +213,7 @@ func buildQemuArgs(cfg *config, cmdline string) []string {
 	if cfg.fullscreen {
 		args = append(args, "-full-screen")
 	}
-	return args
+	return args, nil
 }
 
 // QEMU's structured option parser uses commas as separators and represents a
