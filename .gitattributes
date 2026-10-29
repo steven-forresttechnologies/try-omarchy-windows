@@ -1,5 +1,9 @@
 app/testdata/SHA256SUMS.* text eol=lf
 
+# Bash runs these on Linux and in Windows MSYS2; CRLF breaks its option parsing.
+runtime-build/**/*.sh text eol=lf
+scripts/release/**/*.sh text eol=lf
+
 # Runtime patches are digest-pinned and must be byte-identical on Windows.
 runtime-build/patches/**/*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
 

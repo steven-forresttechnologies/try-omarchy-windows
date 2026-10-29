@@ -116,6 +116,18 @@ x86 artifacts or assume the release installation format. Feature parity remains
 an acceptance gate. Do not enable those controls by removing the architecture
 guard.
 
+The current runtime explicitly blocks migration because its WHPX GIC state
+save/restore path is not implemented. Inspect that boundary without a user disk:
+
+```powershell
+python runtime-build/smoke-arm64-migration.py C:\ReviewedRuntime\bin\qemu-system-aarch64.exe --output C:\Proof\migration.json
+```
+
+The probe starts a paused, diskless VM and discards any outgoing migration
+stream. A successful probe process is a collected observation, not a saved-session
+acceptance result. An incoming restore and real guest/device continuity must
+still be tested before saved-session controls can be enabled.
+
 ## Native host-import readback
 
 `runtime-build/test-vulkan-host-import.c` tests the specific imported-memory

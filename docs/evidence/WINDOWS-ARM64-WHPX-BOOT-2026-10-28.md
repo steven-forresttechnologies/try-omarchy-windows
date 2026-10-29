@@ -755,3 +755,45 @@ release controls remain disabled. Tray/settings/update/recovery management,
 saved sessions, larger GPU apertures, physical input/audio/peripherals,
 clipboard roundtrips, host power behavior and sustained application testing
 remain gates before opening a PR or publishing an ARM release.
+
+### Post-checkpoint regression and migration boundary
+
+Additional validation of the committed source passed 35 release-helper tests,
+15 GPU-helper tests, two shell-canary tests, the PE/DLL collector checks and
+all source-lock validations. Native Linux ARM64 Go 1.27.3 then passed
+`go test -race ./...` (main package 75.529 seconds). The official Linux ARM64
+toolchain archive hash was verified before use. These checks supplement the
+native Windows suite; they do not exercise Windows syscall ABI under the race
+detector. The local combined log is `C:/temp/omarchy-arm64-linux-regression.log`.
+
+A Windows Git archive with `core.autocrlf=true` reproduced Bash failures from
+CRLF shell scripts. Scoped `.gitattributes` rules now retain LF throughout the
+runtime and release shell-script directories, including nested guest-upgrade
+helpers. An archive made with the Windows setting and the updated policy
+contained all 18 applicable shell scripts without CRLF. Source blobs already
+had LF; the failure was checkout/export conversion, not altered Bash logic.
+
+Native fullscreen activation visibly rendered the GPU desktop without Windows
+window chrome. The 90-second bounded run powered off cleanly. The attempted
+cursor-release input coincided with automatic shutdown and is not recorded as
+a passed input test.
+
+`runtime-build/smoke-arm64-migration.py` starts an isolated paused, diskless
+ARM64 WHPX VM, queries migration state, attempts outgoing migration to a
+discarding loopback receiver and quits with a bounded cleanup. On this
+Snapdragon, both `query-migrate` and the attempted migration reported:
+
+> Live migration disabled because GIC state save/restore not supported on WHPX
+
+No RAM stream bytes were emitted; QEMU quit with exit 0. The observation is
+`arm64-proof/whpx-arm64-migration-boundary.json` outside the fork. No user disk
+or live Omarchy session participated, and no incoming restore was attempted.
+
+This is a runtime boundary, not proof that the operating system cannot support
+the feature. Microsoft's current documentation describes per-processor and
+global ARM64 GIC categories in
+[`WHvGetVirtualProcessorState`](https://learn.microsoft.com/da-dk/virtualization/api/hypervisor-platform/funcs/whvgetvirtualprocessorstate)
+and matching restore through `WHvSetVirtualProcessorState`. Both API exports are
+present in the native system DLL on this machine. The inference to investigate
+next is a QEMU implementation using those APIs; export presence alone does not
+prove successful state transfer, ABI correctness, compatibility or restore.
